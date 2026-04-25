@@ -12,6 +12,7 @@ Application
 │ ├ Header
 │ │ ├ Version
 │ │ ├ Battery
+│ │ │ └ Emergency Shutdown
 │ │ └ Diagnostics
 │ ├ Browser
 │ └ Footer
@@ -52,18 +53,38 @@ The application's semver version string, rendered at the left end of the header 
 # Battery
 
 [Up](#header)
+[Down](#emergency-shutdown)
 
-A small icon at the right end of the header showing remaining charge. Icon only — no percentage text.
+A small icon at the right end of the header showing remaining charge, with the cell voltage as text directly below.
+
+> [!IMPORTANT]
+> No software-readable charging state on this hardware. The TP4057 charger is purely analog; its status pins are not routed to a GPIO. See `reference/notes.md`.
 
 **Detail**
 
-- Icon 27px wide × 8px tall, at the right end of the header.
+- Icon 30 px wide × 8 px tall. Voltage label `N.NNv` (2 dp) centred horizontally beneath the icon, in the diagnostics row.
 
-- Read via `M5.Power.getBatteryLevel()` (returns 0–100, negative if unavailable).
+- Level rescaled from voltage: `clamp((mv − 3400) × 100 / (3800 − 3400), 0, 100)`. Bounds (`LOADED_EMPTY_MV`, `LOADED_FULL_MV`) calibrated to the loaded voltage range on this hardware — the M5 default 3.3–4.1 V map gives a stuck-blue ceiling because a charged cell sags below 4.1 V under load. Empty is set above the 3.0 V damage threshold for cell longevity.
 
-- Polled every few seconds; the reading changes slowly.
+- Fill colour by level: green / blue / yellow / red / bright-red bands. Polled every few seconds.
 
-- Fill colour by level: `> 80%` green, `> 40%` blue, `> 20%` yellow, `> 10%` red, `≤ 10%` bright red.
+# Emergency Shutdown
+
+[Up](#battery)
+
+When the cell hits the empty cutoff, the device protects itself by powering off cleanly rather than letting the cell discharge further.
+
+**Detail**
+
+- Triggered when displayed level reaches 0 (voltage ≤ `LOADED_EMPTY_MV`).
+
+- Playback stops, the screen blanks, and a centred "battery empty" warning shows for 10 seconds. Then `M5.Power.powerOff()` puts the ESP32 into deep sleep.
+
+- One-way: with no charging signal available, plugging in USB during the warning window has no effect. Recovery is a physical power-cycle.
+
+- On boot, if voltage is already at or below `CRITICAL_EMPTY_MV` (~3300 mV), skip the warning and sleep immediately — the cell has dropped past the warning band during a previous off-then-on cycle without charging, and further on-time would only stress it.
+
+- Recovery: leave SW1 on, plug in USB. While in deep sleep the ESP32 draws ~10 µA, so TP4057 charges the cell at near-full rate. To resume use, press the boot button (BTN1) or briefly unplug-and-replug USB to trigger a hardware reset.
 
 # Diagnostics
 

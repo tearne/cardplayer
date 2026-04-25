@@ -51,6 +51,20 @@ static constexpr int COL_PAD      = 2;
 static constexpr int MAX_VOL      = 10;
 static constexpr uint32_t BATTERY_POLL_MS = 5000;
 
+static constexpr int BATTERY_ICON_W = 30;
+static constexpr int BATTERY_ICON_H = 8;
+static constexpr int BATTERY_ICON_X = SCREEN_W - BATTERY_ICON_W - 3;
+static constexpr int BATTERY_ICON_Y = 1;
+static constexpr uint32_t BATTERY_LOW_TIMEOUT_MS = 10000;
+
+// Dev-mode flag: raises the empty thresholds so the warning + immediate-sleep
+// paths can be exercised without depleting the cell. Production thresholds
+// when false are 3400 / 3300 mV.
+static constexpr bool BATTERY_DEV_MODE = true;
+static constexpr int LOADED_EMPTY_MV   = BATTERY_DEV_MODE ? 3700 : 3400;
+static constexpr int CRITICAL_EMPTY_MV = BATTERY_DEV_MODE ? 3600 : 3300;
+static constexpr int LOADED_FULL_MV    = 3830;
+
 // Colours (RGB565). Each kind has three brightness tiers:
 // BRIGHT (selected), NORMAL (non-selected active column), DIM (preview column).
 static constexpr uint16_t COL_DIR_BRIGHT    = 0x5D9F;
@@ -98,8 +112,11 @@ static AudioOutputM5CardputerSpeaker* g_out = nullptr;
 
 static uint32_t g_last_progress_ms = 0;
 
-static int      g_battery_level   = -1;
-static uint32_t g_battery_last_ms = 0;
+static int      g_battery_level     = -1;
+static int      g_battery_voltage_mv = 0;
+static uint32_t g_battery_last_ms   = 0;
+
+static void enterBatteryLowState();
 
 static SemaphoreHandle_t g_audio_mutex = nullptr;
 static TaskHandle_t      g_audio_task  = nullptr;
@@ -278,6 +295,14 @@ static void drawDiagnosticsRow() {
 
     d.setCursor(BAR_X + BAR_W + 4, HEADER_ROW2_Y);
     d.printf("u:%u", (unsigned)g_diag_underruns);
+
+    // Battery voltage centred under the battery icon.
+    constexpr int volt_w = 5 * CHAR_W;  // "N.NNv"
+    constexpr int volt_x = BATTERY_ICON_X + BATTERY_ICON_W / 2 - volt_w / 2;
+    d.setCursor(volt_x, HEADER_ROW2_Y);
+    d.printf("%d.%02dv",
+             g_battery_voltage_mv / 1000,
+             (g_battery_voltage_mv % 1000) / 10);
 }
 
 static void drawHeader() {
@@ -290,9 +315,9 @@ static void drawHeader() {
     d.setCursor(0, 1);
     d.print(APP_VERSION);
 
-    constexpr int ICON_W = 27, ICON_H = 8;
-    int x = SCREEN_W - ICON_W - 3;
-    int y = 1;
+    constexpr int ICON_W = BATTERY_ICON_W, ICON_H = BATTERY_ICON_H;
+    int x = BATTERY_ICON_X;
+    int y = BATTERY_ICON_Y;
     d.fillRect(x + ICON_W, y + 2, 2, ICON_H - 4, COL_HEADER_TXT);
     d.drawRect(x, y, ICON_W, ICON_H, COL_HEADER_TXT);
     if (g_battery_level > 0) {
@@ -325,14 +350,38 @@ static void pollDiagnostics() {
     M5Cardputer.Display.endWrite();
 }
 
+static int displayedBatteryLevel(int mv) {
+    if (mv <= 0) return -1;
+    int level = (mv - LOADED_EMPTY_MV) * 100 / (LOADED_FULL_MV - LOADED_EMPTY_MV);
+    if (level < 0)   level = 0;
+    if (level > 100) level = 100;
+    return level;
+}
+
 static void pollBattery(bool force = false) {
     uint32_t now = millis();
     if (!force && (now - g_battery_last_ms) < BATTERY_POLL_MS) return;
     g_battery_last_ms = now;
-    int level = M5.Power.getBatteryLevel();
+
+    int16_t mv = M5.Power.getBatteryVoltage();
+    g_battery_voltage_mv = (mv > 0) ? mv : 0;
+
+    // Below the warning band: the cell has dropped past the empty cutoff
+    // during a previous off-then-on cycle without charging. Skip the warning
+    // and sleep immediately — further on-time would only stress the cell.
+    if (mv > 0 && mv <= CRITICAL_EMPTY_MV) {
+        M5.Power.powerOff();
+    }
+
+    int level = displayedBatteryLevel(mv);
+
     if (level != g_battery_level) {
         g_battery_level = level;
         drawHeader();
+    }
+
+    if (level == 0) {
+        enterBatteryLowState();
     }
 }
 
@@ -682,6 +731,32 @@ static void changeVolume(int delta) {
     if (g_volume > MAX_VOL) g_volume = MAX_VOL;
     applyVolume();
     drawFooter();
+}
+
+static void enterBatteryLowState() {
+    stopPlayback();
+
+    auto& d = M5Cardputer.Display;
+    d.fillScreen(BLACK);
+    d.setTextSize(2);
+    constexpr int CELL_W = 12, CELL_H = 16;  // size-2 character cell
+
+    auto drawLine = [&](const char* s, int y, uint16_t fg) {
+        d.setTextColor(fg, BLACK);
+        int w = (int)strlen(s) * CELL_W;
+        d.setCursor((SCREEN_W - w) / 2, y);
+        d.print(s);
+    };
+
+    int y = 8;
+    drawLine("Battery empty.",     y, 0xF800); y += CELL_H + 4;
+    drawLine("Powering off.",      y, COL_HEADER_TXT); y += CELL_H + 8;
+    drawLine("To charge:",         y, COL_HEADER_TXT); y += CELL_H + 2;
+    drawLine("plug in USB,",       y, COL_HEADER_TXT); y += CELL_H + 2;
+    drawLine("switch power ON.",   y, COL_HEADER_TXT);
+
+    delay(BATTERY_LOW_TIMEOUT_MS);
+    M5.Power.powerOff();
 }
 
 void setup() {
