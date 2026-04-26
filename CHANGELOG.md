@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.0 — 2026-04-26
+
+- Footer redesigned as a single compact line: the playing track's name marquee-scrolls when too long for its slot, the progress bar carries play/pause state through its colour (slate-blue while playing, mid-grey while paused or stopped), and a teal volume bar sits at the right. Footer height halved from 16 px to 10 px, so the browser gains 6 px of vertical space. The hairline above the footer picks up the same slate-blue, framing the strip as a distinct region.
+
+## 0.8.0 — 2026-04-26
+
+- New keybindings: `+` / `_` for font size, `` ` `` to hide the diagnostics row, `\` to toggle filename wrapping, `?` for an in-app help screen, `'` to jump back to the currently-playing track, and Fn+`,` / Fn+`/` for previous / next track within the playing folder.
+- Quieter browser look — no more printer-bar zebra, hairline rules between entries and around the browser frame, inverted-row selection in place of an outline, and slate-blue file names distinguishing them from cyan-blue directories. The first entry off the bottom partially renders to signal "scroll for more"; long names clip at the column edge instead of truncating with `...`.
+- Diagnostics row redesigned as labelled proportion bars instead of numeric readouts; ring-buffer headroom bar narrower and grey. Volume rendered as a bar in the footer.
+- Larger default font; the smaller font remains available via `_`. Filename wrapping is on by default but never wraps in the narrow preview column.
+
+## 0.7.0 — 2026-04-26
+
+- M4A audio playback. DRM-free .m4a and .mp4 files (AAC inside an MP4 container) now play alongside WAV / MP3 / FLAC / AAC, including seek and end-of-track advance.
+
+## 0.6.0 — 2026-04-26
+
+- Battery indicator now reflects the real charge level — calibrated to the loaded voltage range seen on this device, so a charged cell shows green rather than sticking in the blue 40–80% band. Cell voltage is also shown numerically in the diagnostics row.
+- New emergency shutdown when the cell hits empty: playback stops, a "Battery Empty" warning shows for 10 seconds, and the device enters deep sleep to protect the cell. Resume by plugging in USB with the power switch on, then power-cycling.
+
 ## 0.5.0 — 2026-04-25
 
 - Within-track seek: hold `[` / `]` to scrub backward / forward (works while paused), or press a digit key to jump to that tenth (`1` = start, `5` = 40%, `0` = 90%).

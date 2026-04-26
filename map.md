@@ -17,6 +17,7 @@ Application
 │ ├ Browser
 │ └ Footer
 ├ Playback
+│ └ Audio Formats
 └ Controls
 ```
 
@@ -78,7 +79,9 @@ When the cell hits the empty cutoff, the device protects itself by powering off 
 
 - Triggered when displayed level reaches 0 (voltage ≤ `LOADED_EMPTY_MV`).
 
-- Playback stops, the screen blanks, and a centred "battery empty" warning shows for 10 seconds. Then `M5.Power.powerOff()` puts the ESP32 into deep sleep.
+- Playback stops, the screen blanks, and a centred warning shows for 10 seconds. Then `M5.Power.powerOff()` puts the ESP32 into deep sleep.
+
+- Warning text: title "Battery Empty" in red, body "Charge with power switch ON" wrapped to two lines. All at double font size.
 
 - One-way: with no charging signal available, plugging in USB during the warning window has no effect. Recovery is a physical power-cycle.
 
@@ -110,7 +113,7 @@ Fills the main area in a two-column 80/20 style. The left column shows the curre
 
 [Up](#screen-layout)
 
-A thin strip at the bottom of the display carrying track name, play/pause state, a progress bar, and the volume level. Always visible, independent of what the browser is showing. When nothing is playing, shows "stopped".
+A thin strip at the bottom of the display carrying — left to right — the playing track's name (marquee-scrolling when longer than its slot), a progress bar, and a volume bar. The progress bar doubles as the play/pause indicator: slate-blue while playing, mid-grey while paused or stopped. The hairline framing the top of the strip is the same slate-blue as the progress bar so the footer reads as a distinct region. Always visible, independent of what the browser is showing and of any chrome-minimisation toggles. When nothing is playing, the name slot shows "stopped".
 
 # Controls
 
@@ -137,6 +140,7 @@ Everything the user does is via the Cardputer's keyboard — there is no touch o
 # Playback
 
 [Up](#application)
+[Down](#audio-formats)
 
 Decoding of the current track runs on its own FreeRTOS task, separate from the main UI loop. The task must not risk blocking the ESP32 task watchdog — large ID3v2 tags, for example, can pin the decoder in a multi-second scan for the first audio frame. Decoded samples flow through a small ring buffer into the I2S driver.
 
@@ -149,3 +153,20 @@ Decoding of the current track runs on its own FreeRTOS task, separate from the m
 - Ring buffer has three slots of 1536 samples, giving the decoder ~100ms of slack before a stall is heard.
 
 - At natural track end, advances to the next audio file in the playing folder (filename order); stops when the folder is exhausted. `<` / `?` provides manual override at any time.
+
+# Audio Formats
+
+[Up](#playback)
+
+The supported formats: FLAC, MP3, AAC, M4A, WAV.
+
+> [!IMPORTANT]
+> M4A is AAC inside an MP4 container, decoded by an in-house demuxer that synthesises an ADTS stream for the existing AAC decoder. DRM-free files only — protected (FairPlay) tracks are rejected at parse.
+
+**Detail**
+
+- WAV / MP3 / FLAC / AAC: handed straight to ESP8266Audio's matching `AudioGenerator`.
+
+- M4A / MP4: wrapped in `AudioFileSourceM4A`, which parses the MP4 box structure, walks the sample tables, and feeds 7-byte-prefixed ADTS frames to `AudioGeneratorAAC`. Sample-size table is read from disk through a 1 KB sliding window; chunk offsets and the synthetic-stream offset table sit in internal RAM. Seek snaps to the nearest chunk boundary.
+
+- Files with multi-track containers, non-`mp4a` codecs, unsupported AAC profiles (only AOT 1–4), out-of-range sample rates (>12) or channel configs, or 64-bit chunk offsets above 4 GB are rejected at parse.

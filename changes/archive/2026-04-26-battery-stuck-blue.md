@@ -20,7 +20,7 @@ Displayed level = `clamp((mv - LOADED_EMPTY_MV) * 100 / (LOADED_FULL_MV - LOADED
 When the displayed level hits 0 (voltage ≤ `LOADED_EMPTY_MV`), enter a 10-second warning state:
 
 1. Stop playback cleanly.
-2. Blank the screen, then draw a centred warning: "Battery empty. Powering off. To charge: plug in USB, switch power ON." Rendered at twice the default font size for legibility.
+2. Blank the screen, then draw a centred two-element warning: title "Battery Empty" in red and body "Charge with power switch ON" wrapped to two lines. All rendered at twice the default font size.
 3. After 10 seconds, call `M5.Power.powerOff()` — ESP32 deep sleep with no wake sources configured (deepest the SoC offers, ~10 µA standby).
 
 If at boot voltage is already at or below `CRITICAL_EMPTY_MV` (3300 mV), skip the warning and sleep immediately — the cell has dropped past the warning band during a previous off-then-on cycle without charging, and further on-time would only stress it.
@@ -33,7 +33,7 @@ The header's existing diagnostics row carries `stk`, `buf`, `u`. Add a fourth fi
 
 ### Battery dev mode
 
-A `BATTERY_DEV_MODE` constant at the top of the file shifts both empty thresholds upward (`LOADED_EMPTY_MV` 3700, `CRITICAL_EMPTY_MV` 3600) so the empty path can be exercised without depleting the cell. Production values are 3400 and 3300. The flag is on for now while the new behaviour is being verified; it will become the seed for the broader developer-mode work tracked in `dev-mode.md`.
+A `BATTERY_DEV_MODE` constant at the top of the file shifts both empty thresholds upward (`LOADED_EMPTY_MV` 3700, `CRITICAL_EMPTY_MV` 3600) so the empty path can be exercised without depleting the cell. Production values are 3400 and 3300. The flag was set `true` during initial verification and is now `false`. It remains in place as the seed for the broader developer-mode work tracked in `dev-mode.md`.
 
 ### Map edits
 
@@ -90,7 +90,9 @@ When the cell hits the empty cutoff, the device protects itself by powering off 
 
 - Triggered when displayed level reaches 0 (voltage ≤ `LOADED_EMPTY_MV`).
 
-- Playback stops, the screen blanks, and a centred "battery empty" warning shows for 10 seconds. Then `M5.Power.powerOff()` puts the ESP32 into deep sleep.
+- Playback stops, the screen blanks, and a centred warning shows for 10 seconds. Then `M5.Power.powerOff()` puts the ESP32 into deep sleep.
+
+- Warning text: title "Battery Empty" in red, body "Charge with power switch ON" wrapped to two lines. All at double font size.
 
 - One-way: with no charging signal available, plugging in USB during the warning window has no effect. Recovery is a physical power-cycle.
 
@@ -129,6 +131,14 @@ When the cell hits the empty cutoff, the device protects itself by powering off 
 
 - [x] Add the new **Emergency Shutdown** node in `map.md` per the Approach (immediately after the Battery node in file order).
 
+### Post-verification adjustments
+
+- [x] Revise the warning text to title "Battery Empty" (red) + body "Charge with power switch ON" (wrapped to two lines).
+
+- [x] Set `BATTERY_DEV_MODE` to `false` (production thresholds: `LOADED_EMPTY_MV` 3400, `CRITICAL_EMPTY_MV` 3300).
+
+- [x] Update the **Emergency Shutdown** node in `map.md` to include the literal warning text.
+
 ## Log
 
 - On-device observation: `LOADED_FULL_MV` set to 3830 (the voltage stabilised at after extended plug-in-and-running). Initial guess of 3850 was close.
@@ -148,3 +158,27 @@ When the cell hits the empty cutoff, the device protects itself by powering off 
 - Diagnostic confirmed: chip-id reads `0x00` in every state — no device responding at `0x49` on `In_I2C`. The whole register-read approach is wrong for this hardware. The Approach's premise that `M5.Power.isCharging()` (or a direct AW32001 read) would yield genuine charging state is false on Cardputer ADV: M5Unified knows the audio codec on `In_I2C` but no charger IC, and battery voltage on this board is read via ADC, not I2C. Our `isChargingAw32001()` has been silently returning false since the build was completed — the charging-fill colour was unreachable. **Blocker: no known way to obtain hardware charging state on this board without further reconnaissance** (I2C scan to find any responding charger IC, or consulting the Cardputer ADV schematic for a CHG_STAT GPIO line). Path forward is a planning question, not a build decision.
 
 - Schematic-confirmed: charger IC is **TP4057** (linear single-cell Li-ion charger, no I2C, charge current ~300 mA via R5 = 3.3 kΩ on PROG). Its `CHRG`/`STDBY` open-drain status pins do not appear to be routed to any Stamp-S3 GPIO at the schematic resolution available — most likely they drive an LED or are unconnected. Schematic and TP4057 datasheet saved under `reference/`. With a 100 W USB supply the cell does charge while the device runs, just imperceptibly through the 3.6–3.8 V Li-ion plateau (60 mV in 20 minutes is consistent with full ~300 mA charge into 1750 mAh). The original "stuck" symptom on a weaker source was likely real USB current limiting, not a hardware fault. Closing out by dropping the charging indicator entirely; auto-shutdown becomes a one-way 10 s countdown.
+
+- Post-verification (2026-04-26): warning text trimmed to two elements — "Battery Empty" title in red plus "Charge with power switch ON" body wrapped over two lines, all at double font size. Original five-line text was busy at that size. `BATTERY_DEV_MODE` flipped to `false` (production thresholds restored: `LOADED_EMPTY_MV` 3400, `CRITICAL_EMPTY_MV` 3300) — verification of the warning + countdown + immediate-sleep paths was sufficient. Map node updated to include the literal warning text rather than a generic reference.
+
+## Conclusion
+
+Shipped as a replan: the original charging indicator turned out to be unsupportable on this hardware (the Cardputer ADV's TP4057 charger has no software-readable status). The change was scoped down to voltage-driven level calibration plus an Emergency Shutdown failsafe.
+
+Documents added outside the Plan:
+
+- `reference/Cardputer-ADV-schematic-v1.0.pdf` — official schematic.
+- `reference/TP4057-datasheet.pdf` — charger IC datasheet.
+- `reference/notes.md` — hardware observations and pitfalls (TP4057 specifics, M5Unified's Cardputer ADV mapping, the wrong-chip-inference trap that bit us mid-build).
+- `changes/open/dev-mode.md` — new exploratory proposal spawned as an aside, with `BATTERY_DEV_MODE` as its seed.
+
+### Changelog entry
+
+```
+## 0.6.0 — 2026-04-26
+
+- Battery indicator now reflects the real charge level — calibrated to the loaded voltage range seen on this device, so a charged cell shows green rather than sticking in the blue 40–80% band. Cell voltage is also shown numerically in the diagnostics row.
+- New emergency shutdown when the cell hits empty: playback stops, a "Battery Empty" warning shows for 10 seconds, and the device enters deep sleep to protect the cell. Resume by plugging in USB with the power switch on, then power-cycling.
+```
+
+Bump `APP_VERSION` from `0.5.0` to `0.6.0` alongside the changelog entry.

@@ -1,1 +1,0 @@
-battery-stuck-blue.md
