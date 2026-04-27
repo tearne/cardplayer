@@ -37,7 +37,7 @@ The display is divided into three fixed regions: a header strip at the top, a fo
 [Down](#battery)
 [Down](#diagnostics)
 
-A two-row strip at the top of the display (~18px total). The first row carries status indicators and transient notification banners. The second row carries development-time diagnostics.
+A strip at the top of the display, two rows tall (26 px) when development diagnostics are shown, collapsing to one row (10 px) when hidden. The first row carries the version string and battery readout. The second row carries the diagnostics readouts.
 
 # Version
 
@@ -56,14 +56,14 @@ The application's semver version string, rendered at the left end of the header 
 [Up](#header)
 [Down](#emergency-shutdown)
 
-A small icon at the right end of the header showing remaining charge, with the cell voltage as text directly below.
+A small icon at the right end of the header showing remaining charge, with the cell voltage as text immediately to its left.
 
 > [!IMPORTANT]
 > No software-readable charging state on this hardware. The TP4057 charger is purely analog; its status pins are not routed to a GPIO. See `reference/notes.md`.
 
 **Detail**
 
-- Icon 30 px wide × 8 px tall. Voltage label `N.NNv` (2 dp) centred horizontally beneath the icon, in the diagnostics row.
+- Icon 30 px wide × 8 px tall. Voltage label `N.NNv` (2 dp) sits immediately to the left of the icon in the same row.
 
 - Level rescaled from voltage: `clamp((mv − 3400) × 100 / (3800 − 3400), 0, 100)`. Bounds (`LOADED_EMPTY_MV`, `LOADED_FULL_MV`) calibrated to the loaded voltage range on this hardware — the M5 default 3.3–4.1 V map gives a stuck-blue ceiling because a charged cell sags below 4.1 V under load. Empty is set above the 3.0 V damage threshold for cell longevity.
 
@@ -93,15 +93,21 @@ When the cell hits the empty cutoff, the device protects itself by powering off 
 
 [Up](#header)
 
-Second row of the header, showing live readouts useful during development. Present regardless of what the user is doing.
+Second row of the header, showing live device-resource readouts useful during development. Hideable via the diagnostics toggle.
 
 **Detail**
 
-- **stk** — peak stack usage of the audio task (numeric, e.g. `stk: 3100`).
+- Four numeric readouts plus a per-core CPU graph, refreshed four times a second.
 
-- **buf** — small horizontal bar. Width reflects the margin between decoder and speaker (time spent waiting for the speaker to drain before submitting the next buffer). Near-full means the decoder is ahead; near-empty means it's only just keeping up.
+- **stk** — peak audio-task stack use, as a percentage of its 8 KB allocation. Watermark — never decreases.
 
-- **u:** — cumulative count of ring-empty events. Zero means no audible glitches.
+- **buf** — ring-buffer headroom: time spent waiting for the speaker to drain before submitting the next chunk, as a percentage of a 2 ms cap.
+
+- **ram** — internal-heap use as a percentage of total.
+
+- **u** — cumulative count of ring-buffer underruns since boot.
+
+- **cpu 0 / cpu 1** — per-core load as a percentage; the overlaid sparkline (cyan core 0, orange core 1) holds ~17 s of history.
 
 # Browser
 
@@ -113,7 +119,7 @@ Fills the main area in a two-column 80/20 style. The left column shows the curre
 
 [Up](#screen-layout)
 
-A thin strip at the bottom of the display carrying — left to right — the playing track's name (marquee-scrolling when longer than its slot), a progress bar, and a volume bar. The progress bar doubles as the play/pause indicator: slate-blue while playing, mid-grey while paused or stopped. The hairline framing the top of the strip is the same slate-blue as the progress bar so the footer reads as a distinct region. Always visible, independent of what the browser is showing and of any chrome-minimisation toggles. When nothing is playing, the name slot shows "stopped".
+A thin strip at the bottom of the display carrying — left to right — the playing track's name (marquee-scrolling when longer than its slot), a progress bar, and a volume bar. The progress bar doubles as the play/pause indicator: slate-blue while playing, mid-grey while paused or stopped. The hairline framing the top of the strip is the same slate-blue as the progress bar so the footer reads as a distinct region. Always visible, independent of what the browser is showing and of any diagnostics-row toggle. When nothing is playing, the name slot shows "stopped".
 
 # Controls
 

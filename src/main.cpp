@@ -8,6 +8,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <esp_freertos_hooks.h>
+#include <esp_timer.h>
 
 #include <AudioFileSourceSD.h>
 #include <AudioGenerator.h>
@@ -24,14 +26,31 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.9.0";
+static constexpr const char* APP_VERSION = "0.12.0";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
 
-static constexpr int HEADER_FULL_H     = 18;
 static constexpr int HEADER_MIN_H      = 9;
 static constexpr int HEADER_ROW2_Y     = 10;
+static constexpr int HEADER_ROW2_H     = 16;
+static constexpr int HEADER_FULL_H     = HEADER_ROW2_Y + HEADER_ROW2_H;  // 26
+
+// Diagnostics row layout: three regions across the screen.
+// Cells 1 and 2 hold two stacked numeric readouts each; cell 3 carries
+// per-core CPU readouts and sparklines using the full row height.
+//
+//  | stk:NNN% | ram:NNN% | cpu 0:NNN%  ▁▂▃▂▁_▁▂▃ |
+//  | buf:NNN% | u:NN     | cpu 1:NNN%  _▁_▂_▁▁▁_ |
+//
+static constexpr int DIAG_NUM_CELL_W  = SCREEN_W / 4;                       // 60
+static constexpr int DIAG_CPU_CELL_X  = DIAG_NUM_CELL_W * 2;                // 120
+static constexpr int DIAG_TOP_Y       = HEADER_ROW2_Y;                      // 10
+static constexpr int DIAG_BOT_Y       = HEADER_ROW2_Y + 8;                  // 18
+static constexpr int DIAG_CPU_LABEL_W = 48;                                 // 8 chars × 6 px (worst case "cpu:100%") + gutter
+static constexpr int DIAG_CPU_GRAPH_X = DIAG_CPU_CELL_X + DIAG_CPU_LABEL_W; // 168
+static constexpr int DIAG_CPU_GRAPH_W = SCREEN_W - DIAG_CPU_GRAPH_X - 2;    // 70
+static constexpr int DIAG_CPU_GRAPH_H = 7;
 
 // Footer slots — left to right within the footer band (see footerH).
 // Play/pause state is conveyed by the progress bar's colour (slate-blue while
@@ -47,11 +66,19 @@ static constexpr int FOOTER_BAR_H  = 6;
 static constexpr uint32_t AUDIO_TASK_STACK    = 8 * 1024;
 static constexpr UBaseType_t AUDIO_TASK_PRIO  = 3;
 static constexpr BaseType_t AUDIO_TASK_CORE   = 1;
-static constexpr uint32_t DIAGNOSTICS_POLL_MS = 1000;
+static constexpr uint32_t DIAGNOSTICS_POLL_MS = 250;
 
 static constexpr int COL_CUR_W    = (SCREEN_W * 4) / 5;       // 192
 static constexpr int COL_PREV_X   = COL_CUR_W;
 static constexpr int COL_PREV_W   = SCREEN_W - COL_CUR_W;     // 48
+
+// Active column reserves a narrow gutter on its right edge for the scrollbar.
+// Content (names, wrap, clip) uses COL_CUR_CONTENT_W; the gutter starts at
+// COL_CUR_W - SCROLLBAR_W and ends at the column divider.
+static constexpr int SCROLLBAR_W       = 3;
+static constexpr int COL_CUR_CONTENT_W = COL_CUR_W - SCROLLBAR_W;
+static constexpr int SCROLLBAR_X       = COL_CUR_W - SCROLLBAR_W;
+static constexpr int SCROLLBAR_MIN_H   = 6;
 
 static constexpr int BASE_ROW_H   = 9;
 static constexpr int BASE_CHAR_W  = 6;
@@ -93,8 +120,15 @@ static constexpr uint16_t COL_FOOTER_IDLE  = 0x7BEF;  // progress bar while paus
 static constexpr uint16_t COL_FOOTER_VOL   = 0x34D0;  // volume bar (muted teal)
 static constexpr uint16_t COL_FOOTER_FRAME = 0x6979;  // hairline above footer
 
+// Off-screen back buffer. All draw operations target g_canvas; once a frame
+// is composed, presentFrame() pushes it to the panel in one operation, so
+// the panel transitions directly from old content to new — no fillRect-then-
+// redraw flicker.
+static M5Canvas g_canvas(&M5Cardputer.Display);
+static inline void presentFrame() { g_canvas.pushSprite(0, 0); }
+
 static int  g_font_notch     = 1;
-static bool g_chrome_minimal = false;
+static bool g_diagnostics_hidden = false;
 static bool g_show_help      = false;
 static bool g_wrap_names     = true;
 
@@ -114,7 +148,7 @@ static inline const lgfx::IFont* notchFont() { return FONT_NOTCHES[g_font_notch]
 static inline int notchSize() { return FONT_NOTCHES[g_font_notch].text_size; }
 static inline int rowH()      { return FONT_NOTCHES[g_font_notch].row_h; }
 static inline int charW()     { return FONT_NOTCHES[g_font_notch].char_w; }
-static inline int headerH()  { return g_chrome_minimal ? HEADER_MIN_H : HEADER_FULL_H; }
+static inline int headerH()  { return g_diagnostics_hidden ? HEADER_MIN_H : HEADER_FULL_H; }
 static inline int footerH()  { return 10; }
 static inline int browserY() { return headerH(); }
 static inline int browserH() { return SCREEN_H - headerH() - footerH(); }
@@ -156,6 +190,11 @@ static constexpr uint32_t MARQUEE_TICK_MS  = 50;    // ~20 Hz
 static constexpr uint32_t MARQUEE_PAUSE_MS = 1000;  // start + end pauses
 
 static uint32_t g_last_seek_ms = 0;
+static uint32_t g_last_nav_ms  = 0;
+// Time the current up/down hold started; 0 when no key is held. Used to gate
+// the initial repeat behind a long delay so a normal tap (~150 ms dwell)
+// doesn't double-fire.
+static uint32_t g_nav_press_ms = 0;
 static uint32_t g_audio_start_offset = 0;
 
 static AudioFileSource*               g_src = nullptr;
@@ -177,6 +216,48 @@ static uint32_t g_diag_last_ms   = 0;
 static uint32_t g_diag_stack_used = 0;
 static uint32_t g_diag_underruns  = 0;
 static uint32_t g_diag_wait_us    = 0;
+
+// One sample per pixel of graph width; new samples land on the right and
+// the buffer slides left once full. Stored as 0..255 so each bar's height
+// and threshold colour come straight out of one byte. Only the CPU cell
+// has a sparkline; stk / buf / ram are shown as raw numbers since they
+// move slowly and a graph adds little.
+struct Sparkline {
+    uint8_t  samples[DIAG_CPU_GRAPH_W] = {0};
+    int      count                     = 0;
+};
+
+static Sparkline g_spark_cpu0;
+static Sparkline g_spark_cpu1;
+
+// Latest sampled values, displayed as numerics each tick.
+static int g_diag_stk_pct = 0;
+static int g_diag_buf_pct = 0;
+static int g_diag_ram_pct = 0;
+static int g_diag_cpu0_pct = 0;
+static int g_diag_cpu1_pct = 0;
+
+// CPU sampling: a FreeRTOS idle hook on each core ticks a counter every
+// time the idle task gets a turn. Per-second delta is the call rate, which
+// inversely correlates with load. We normalise against the highest rate
+// observed so far — that's the "fully-idle" reference. Load = 1 − (rate /
+// max_rate).
+//
+// Why this and not a direct time-based measurement? The idle task on this
+// build uses WAITI to actually sleep the CPU between FreeRTOS ticks (1 kHz),
+// so the hook fires at ~1 ms intervals when idle. Gaps between consecutive
+// hook calls don't distinguish "1 ms tick wakeup" (idle) from "1 ms
+// preemption" (busy). The rate-counter approach sidesteps that.
+//
+// Cost: a brief calibration period — the first sample shows 0 % load on
+// each core until that core has seen one mostly-idle second to set its
+// max-rate baseline.
+static volatile uint32_t g_idle_calls_0 = 0;
+static volatile uint32_t g_idle_calls_1 = 0;
+static uint32_t g_idle_calls_0_prev = 0;
+static uint32_t g_idle_calls_1_prev = 0;
+static uint32_t g_idle_max_rate_0   = 0;
+static uint32_t g_idle_max_rate_1   = 0;
 
 static bool endsWith(const std::string& s, const char* ext) {
     std::string lower = s;
@@ -331,54 +412,86 @@ static uint16_t batteryColour(int level) {
     return 0xF800;
 }
 
+static void sparklinePush(Sparkline& s, float frac) {
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    uint8_t v = (uint8_t)(frac * 255.0f + 0.5f);
+    if (s.count < DIAG_CPU_GRAPH_W) {
+        s.samples[s.count++] = v;
+    } else {
+        memmove(s.samples, s.samples + 1, DIAG_CPU_GRAPH_W - 1);
+        s.samples[DIAG_CPU_GRAPH_W - 1] = v;
+    }
+}
+
+static uint16_t sparklineColour(uint8_t v) {
+    if (v < 153) return COL_HEADER_TXT;  // <60% — calm
+    if (v < 217) return 0xFE60;          // 60–85% — yellow
+    return 0xF800;                       // >85% — red
+}
+
+// Both cores' load shares a single graph spanning the full row height,
+// drawn as two overlaid lines. Identity is by colour (cyan = core 0,
+// orange = core 1); magnitude is by vertical position. The row's full
+// 16 px gives each line useful Y resolution.
+static void drawCpuOverlay(int x, int y, int h,
+                           const Sparkline& s0, const Sparkline& s1) {
+    auto& d = g_canvas;
+    d.fillRect(x, y, DIAG_CPU_GRAPH_W, h, BLACK);
+    auto plot = [&](const Sparkline& s, uint16_t c) {
+        int start = DIAG_CPU_GRAPH_W - s.count;
+        int prev_dy = -1;
+        for (int i = 0; i < s.count; ++i) {
+            uint8_t v = s.samples[i];
+            int bar = (v * (h - 1) + 127) / 255;
+            int dy = y + h - 1 - bar;
+            int dx = x + start + i;
+            if (prev_dy >= 0) d.drawLine(dx - 1, prev_dy, dx, dy, c);
+            else              d.drawPixel(dx, dy, c);
+            prev_dy = dy;
+        }
+    };
+    plot(s0, 0x07FF);  // core 0 — cyan
+    plot(s1, 0xFC00);  // core 1 — orange
+}
+
 static void drawDiagnosticsRow() {
-    auto& d = M5Cardputer.Display;
-    d.fillRect(0, HEADER_ROW2_Y, SCREEN_W, 8, BLACK);
+    auto& d = g_canvas;
+    d.fillRect(0, HEADER_ROW2_Y, SCREEN_W, HEADER_ROW2_H, BLACK);
     d.setTextSize(1);
     d.setTextColor(COL_HEADER_TXT, BLACK);
 
-    // Two matching diagnostic bars — stack peak (left) and ring-buffer
-    // headroom (right). Same width, same colour, same height; both grey
-    // to keep eye-pull low — they're glances, not actionables.
-    constexpr int DIAG_BAR_W   = 30;
-    constexpr int DIAG_BAR_H   = 6;
-    constexpr int LABEL_CHARS  = 3;
-    constexpr int LABEL_W      = LABEL_CHARS * BASE_CHAR_W;
-    int bar_y = HEADER_ROW2_Y + 1;
+    d.setCursor(0, DIAG_TOP_Y);
+    d.printf("stk:%d%%", g_diag_stk_pct);
+    d.setCursor(0, DIAG_BOT_Y);
+    d.printf("buf:%d%%", g_diag_buf_pct);
 
-    auto drawDiagBar = [&](int label_x, const char* label, uint32_t fill_units, uint32_t total_units) {
-        d.setCursor(label_x, HEADER_ROW2_Y);
-        d.print(label);
-        int bar_x = label_x + LABEL_W + 1;
-        d.drawRect(bar_x, bar_y, DIAG_BAR_W, DIAG_BAR_H, COL_HAIRLINE);
-        d.fillRect(bar_x + 1, bar_y + 1, DIAG_BAR_W - 2, DIAG_BAR_H - 2, BLACK);
-        uint32_t clamped = fill_units > total_units ? total_units : fill_units;
-        int fill = total_units > 0 ? (int)((DIAG_BAR_W - 2) * clamped / total_units) : 0;
-        if (fill > 0) d.fillRect(bar_x + 1, bar_y + 1, fill, DIAG_BAR_H - 2, COL_HAIRLINE);
-        return bar_x + DIAG_BAR_W;
-    };
-
-    int stk_end = drawDiagBar(0, "stk", g_diag_stack_used, AUDIO_TASK_STACK);
-    int buf_label_x = stk_end + 6;
-    int buf_end = drawDiagBar(buf_label_x, "buf",
-                              g_diag_wait_us > 2000 ? 2000 : g_diag_wait_us,
-                              2000);
-
-    d.setCursor(buf_end + 4, HEADER_ROW2_Y);
+    d.setCursor(DIAG_NUM_CELL_W, DIAG_TOP_Y);
+    d.printf("ram:%d%%", g_diag_ram_pct);
+    d.setCursor(DIAG_NUM_CELL_W, DIAG_BOT_Y);
     d.printf("u:%u", (unsigned)g_diag_underruns);
 
-    // Battery voltage centred under the battery icon.
-    constexpr int volt_w = 5 * BASE_CHAR_W;  // "N.NNv"
-    constexpr int volt_x = BATTERY_ICON_X + BATTERY_ICON_W / 2 - volt_w / 2;
-    d.setCursor(volt_x, HEADER_ROW2_Y);
-    d.printf("%d.%02dv",
-             g_battery_voltage_mv / 1000,
-             (g_battery_voltage_mv % 1000) / 10);
+    // Top row carries the "cpu:" label and core 0's percent; bottom row
+    // carries core 1's percent aligned beneath it. Numbers are tinted to
+    // match their respective lines in the overlaid graph (cyan = core 0,
+    // orange = core 1) so the reader knows which is which without a label.
+    d.setCursor(DIAG_CPU_CELL_X, DIAG_TOP_Y);
+    d.print("cpu:");
+    d.setTextColor(0x07FF, BLACK);
+    d.printf("%d%%", g_diag_cpu0_pct);
+
+    d.setCursor(DIAG_CPU_CELL_X + 4 * BASE_CHAR_W, DIAG_BOT_Y);
+    d.setTextColor(0xFC00, BLACK);
+    d.printf("%d%%", g_diag_cpu1_pct);
+
+    d.setTextColor(COL_HEADER_TXT, BLACK);
+
+    drawCpuOverlay(DIAG_CPU_GRAPH_X, HEADER_ROW2_Y, HEADER_ROW2_H,
+                   g_spark_cpu0, g_spark_cpu1);
 }
 
 static void drawHeader() {
-    auto& d = M5Cardputer.Display;
-    d.startWrite();
+    auto& d = g_canvas;
     d.fillRect(0, 0, SCREEN_W, headerH(), BLACK);
 
     d.setTextSize(1);
@@ -397,8 +510,42 @@ static void drawHeader() {
         d.fillRect(x + 1, y + 1, fw, ICON_H - 2, batteryColour(g_battery_level));
     }
 
-    if (!g_chrome_minimal) drawDiagnosticsRow();
-    d.endWrite();
+    // Voltage readout sits just left of the battery icon: was on row 2, but
+    // row 2 is now the sparkline strip and the voltage's natural neighbour
+    // is the icon anyway.
+    constexpr int VOLT_W = 5 * BASE_CHAR_W;
+    int vx = BATTERY_ICON_X - VOLT_W - 2;
+    d.setCursor(vx, 1);
+    d.printf("%d.%02dv",
+             g_battery_voltage_mv / 1000,
+             (g_battery_voltage_mv % 1000) / 10);
+
+    if (!g_diagnostics_hidden) drawDiagnosticsRow();
+    presentFrame();
+}
+
+static bool IRAM_ATTR idleHookCore0() { ++g_idle_calls_0; return true; }
+static bool IRAM_ATTR idleHookCore1() { ++g_idle_calls_1; return true; }
+
+// Returns the per-core idle fraction over the interval since the previous
+// call, [0..1]. Each core's max rate self-calibrates to the highest delta
+// seen so far; once it has seen a mostly-idle second the readings are
+// stable.
+static void sampleCpuIdleFractions(float& idle_0, float& idle_1) {
+    uint32_t now_0 = g_idle_calls_0;
+    uint32_t now_1 = g_idle_calls_1;
+    uint32_t d0 = now_0 - g_idle_calls_0_prev;
+    uint32_t d1 = now_1 - g_idle_calls_1_prev;
+    g_idle_calls_0_prev = now_0;
+    g_idle_calls_1_prev = now_1;
+
+    if (d0 > g_idle_max_rate_0) g_idle_max_rate_0 = d0;
+    if (d1 > g_idle_max_rate_1) g_idle_max_rate_1 = d1;
+
+    idle_0 = g_idle_max_rate_0 > 0 ? (float)d0 / (float)g_idle_max_rate_0 : 0.0f;
+    idle_1 = g_idle_max_rate_1 > 0 ? (float)d1 / (float)g_idle_max_rate_1 : 0.0f;
+    if (idle_0 > 1.0f) idle_0 = 1.0f;
+    if (idle_1 > 1.0f) idle_1 = 1.0f;
 }
 
 static void pollDiagnostics() {
@@ -416,10 +563,35 @@ static void pollDiagnostics() {
         g_diag_underruns = g_out->underruns();
         g_diag_wait_us   = g_out->lastWaitMicros();
     }
-    if (g_show_help || g_chrome_minimal) return;
-    M5Cardputer.Display.startWrite();
+
+    g_diag_stk_pct = (int)(100.0f * (float)g_diag_stack_used
+                           / (float)AUDIO_TASK_STACK + 0.5f);
+
+    // Buffer headroom: time the audio task spent waiting for the speaker to
+    // drain before submitting the next chunk. More wait = more headroom.
+    // Capped at 2 ms (the original full-bar mark).
+    float buf_frac = g_diag_wait_us > 2000 ? 1.0f
+                                            : (float)g_diag_wait_us / 2000.0f;
+    g_diag_buf_pct = (int)(100.0f * buf_frac + 0.5f);
+
+    uint32_t heap_total = ESP.getHeapSize();
+    uint32_t heap_free  = ESP.getFreeHeap();
+    g_diag_ram_pct = heap_total > 0
+        ? (int)(100.0f * (float)(heap_total - heap_free)
+                / (float)heap_total + 0.5f) : 0;
+
+    float idle0, idle1;
+    sampleCpuIdleFractions(idle0, idle1);
+    float load0 = 1.0f - idle0;
+    float load1 = 1.0f - idle1;
+    sparklinePush(g_spark_cpu0, load0);
+    sparklinePush(g_spark_cpu1, load1);
+    g_diag_cpu0_pct = (int)(100.0f * load0 + 0.5f);
+    g_diag_cpu1_pct = (int)(100.0f * load1 + 0.5f);
+
+    if (g_show_help || g_diagnostics_hidden) return;
     drawDiagnosticsRow();
-    M5Cardputer.Display.endWrite();
+    presentFrame();
 }
 
 static int displayedBatteryLevel(int mv) {
@@ -460,7 +632,7 @@ static void pollBattery(bool force = false) {
 // Footer text always renders at size 1 with the default Font0, regardless of
 // the browser's font notch — the footer band is fixed-height.
 static inline void setFooterText(uint16_t fg) {
-    auto& d = M5Cardputer.Display;
+    auto& d = g_canvas;
     d.setFont(&fonts::Font0);
     d.setTextSize(1);
     d.setTextWrap(false, false);
@@ -468,10 +640,9 @@ static inline void setFooterText(uint16_t fg) {
 }
 
 static void drawSlotName() {
-    auto& d = M5Cardputer.Display;
+    auto& d = g_canvas;
     int fy = footerY();
     int fh = footerH();
-    d.startWrite();
     d.fillRect(FOOTER_NAME_X, fy, FOOTER_NAME_W, fh, BLACK);
     d.setClipRect(FOOTER_NAME_X, fy, FOOTER_NAME_W, fh);
     setFooterText(COL_FOOTER_TXT);
@@ -479,17 +650,15 @@ static void drawSlotName() {
     d.setCursor(FOOTER_NAME_X - g_marquee.offset_px, fy + (fh - 8) / 2);
     d.print(name.c_str());
     d.clearClipRect();
-    d.endWrite();
 }
 
 static void drawSlotProgress() {
-    auto& d = M5Cardputer.Display;
+    auto& d = g_canvas;
     int fy = footerY();
     int fh = footerH();
     int by = fy + (fh - FOOTER_BAR_H) / 2;
     bool playing = !g_play_path.empty() && !g_paused;
     uint16_t col = playing ? COL_FOOTER_PROG : COL_FOOTER_IDLE;
-    d.startWrite();
     d.fillRect(FOOTER_PROG_X, fy, FOOTER_PROG_W, fh, BLACK);
     d.drawRect(FOOTER_PROG_X, by, FOOTER_PROG_W, FOOTER_BAR_H, col);
     if (g_src && !g_play_path.empty()) {
@@ -505,15 +674,13 @@ static void drawSlotProgress() {
             }
         }
     }
-    d.endWrite();
 }
 
 static void drawSlotVolume() {
-    auto& d = M5Cardputer.Display;
+    auto& d = g_canvas;
     int fy = footerY();
     int fh = footerH();
     int by = fy + (fh - FOOTER_BAR_H) / 2;
-    d.startWrite();
     d.fillRect(FOOTER_VOL_X, fy, FOOTER_VOL_W, fh, BLACK);
     d.drawRect(FOOTER_VOL_X, by, FOOTER_VOL_W, FOOTER_BAR_H, COL_FOOTER_VOL);
     int inner = FOOTER_VOL_W - 2;
@@ -522,17 +689,15 @@ static void drawSlotVolume() {
         d.fillRect(FOOTER_VOL_X + 1, by + 1, w, FOOTER_BAR_H - 2,
                    COL_FOOTER_VOL);
     }
-    d.endWrite();
 }
 
 static void drawFooter() {
-    auto& d = M5Cardputer.Display;
-    d.startWrite();
+    auto& d = g_canvas;
     d.fillRect(0, footerY(), SCREEN_W, footerH(), BLACK);
-    d.endWrite();
     drawSlotName();
     drawSlotProgress();
     drawSlotVolume();
+    presentFrame();
 }
 
 static void pollMarquee() {
@@ -551,6 +716,7 @@ static void pollMarquee() {
         int text_w = (int)name.size() * BASE_CHAR_W;
         g_marquee.max_offset_px = std::max(0, text_w - FOOTER_NAME_W);
         drawSlotName();
+        presentFrame();
         return;
     }
 
@@ -580,12 +746,15 @@ static void pollMarquee() {
             }
             break;
     }
-    if (g_marquee.offset_px != prev_offset) drawSlotName();
+    if (g_marquee.offset_px != prev_offset) {
+        drawSlotName();
+        presentFrame();
+    }
 }
 
 static void drawEntry(int x, int col_w, int y, const Entry& e,
                       bool selected, bool preview, bool wrap) {
-    auto& d = M5Cardputer.Display;
+    auto& d = g_canvas;
     int cpl   = charsPerLine(col_w);
     int rows  = entryRows(e, col_w, wrap);
     int rh    = rowH();
@@ -617,12 +786,19 @@ static void drawEntry(int x, int col_w, int y, const Entry& e,
     }
 }
 
-static void drawColumn(int x, int col_w, const std::vector<Entry>& items,
-                       int cursor, int top, bool is_active, bool dim) {
-    auto& d = M5Cardputer.Display;
+// Returns the number of entries that were rendered (started before the
+// column ran out of room). Callers use this for the scrollbar viewport.
+static int drawColumn(int x, int col_w, const std::vector<Entry>& items,
+                      int cursor, int top, bool is_active, bool dim) {
+    auto& d = g_canvas;
     int by = browserY();
     int bh = browserH();
     d.fillRect(x, by, col_w, bh, BLACK);
+
+    // Active column reserves a gutter on its right edge for the scrollbar;
+    // names wrap and clip against the narrower content width so the thumb
+    // never overpaints them.
+    int content_w = is_active ? COL_CUR_CONTENT_W : col_w;
 
     int y = by;
     // Row by+bh-1 is reserved for the bottom separator (drawn by drawBrowser).
@@ -634,26 +810,29 @@ static void drawColumn(int x, int col_w, const std::vector<Entry>& items,
     bool wrap = is_active && g_wrap_names;
     // Clip so the entry that crosses the bottom edge renders only its visible
     // portion — the cut-off look signals "more below" without leaving a gap.
-    d.setClipRect(x, by, col_w, bh);
+    d.setClipRect(x, by, content_w, bh);
     // Disable M5GFX's auto text-wrap so a long single-line name clips at the
     // column edge instead of being pushed onto a second row by the renderer.
     d.setTextWrap(false, false);
+    int visible = 0;
     for (int i = top; i < (int)items.size() && y < y_max; ++i) {
-        int rows = entryRows(items[i], col_w, wrap);
+        int rows = entryRows(items[i], content_w, wrap);
         int h = rows * rh;
         bool selected = is_active && (i == cursor);
-        drawEntry(x, col_w, y, items[i], selected, dim, wrap);
+        drawEntry(x, content_w, y, items[i], selected, dim, wrap);
         // Hairline above every entry except the first visible one. Drawn
         // after drawEntry so its bg fill doesn't overwrite the line.
         if (i > top) {
-            d.drawFastHLine(x, y, col_w, COL_HEADER_TXT);
+            d.drawFastHLine(x, y, content_w, COL_HEADER_TXT);
         }
         y += h;
+        ++visible;
     }
     d.clearClipRect();
-    // Restore default font so subsequent setTextSize() calls in chrome
-    // draws aren't affected by the browser notch font.
+    // Restore default font so subsequent setTextSize() calls in header /
+    // footer draws aren't affected by the browser notch font.
     d.setFont(&fonts::Font0);
+    return visible;
 }
 
 static void refreshPreview() {
@@ -682,7 +861,7 @@ static void ensureCursorVisible() {
         int y_max = by + bh - 1;  // last usable row, see drawColumn
         bool fits = false;
         for (int i = g_top; i <= g_cursor; ++i) {
-            int h = entryRows(g_entries[i], COL_CUR_W, g_wrap_names) * rh;
+            int h = entryRows(g_entries[i], COL_CUR_CONTENT_W, g_wrap_names) * rh;
             if (i == g_cursor) { fits = (y + h) <= y_max; break; }
             y += h;
         }
@@ -691,9 +870,24 @@ static void ensureCursorVisible() {
     }
 }
 
+static void drawScrollbar(int visible, int total) {
+    if (total <= 0 || visible >= total) return;
+    auto& d = g_canvas;
+    int by = browserY();
+    int bh = browserH();
+    // Track height excludes the bottom separator row.
+    int track_h = bh - 1;
+    int thumb_h = (track_h * visible) / total;
+    if (thumb_h < SCROLLBAR_MIN_H) thumb_h = SCROLLBAR_MIN_H;
+    if (thumb_h > track_h) thumb_h = track_h;
+    int thumb_top = by + (int)((int64_t)(track_h - thumb_h) * g_top / (total - visible));
+    if (thumb_top < by) thumb_top = by;
+    if (thumb_top + thumb_h > by + track_h) thumb_top = by + track_h - thumb_h;
+    d.fillRect(SCROLLBAR_X, thumb_top, SCROLLBAR_W, thumb_h, COL_HEADER_TXT);
+}
+
 static void drawBrowser() {
-    auto& d = M5Cardputer.Display;
-    d.startWrite();
+    auto& d = g_canvas;
     int by = browserY();
     int bh = browserH();
     if (g_entries.empty()) {
@@ -705,20 +899,19 @@ static void drawBrowser() {
     } else {
         refreshPreview();
         ensureCursorVisible();
-        drawColumn(0, COL_CUR_W, g_entries, g_cursor, g_top, true, false);
+        int visible = drawColumn(0, COL_CUR_W, g_entries, g_cursor, g_top, true, false);
         drawColumn(COL_PREV_X, COL_PREV_W, g_preview, -1, 0, false, true);
+        drawScrollbar(visible, (int)g_entries.size());
         d.drawFastVLine(COL_PREV_X, by, bh, COL_HEADER_TXT);
     }
     d.drawFastHLine(0, by,          SCREEN_W, COL_HEADER_TXT);
     d.drawFastHLine(0, by + bh - 1, SCREEN_W, COL_FOOTER_FRAME);
-    d.endWrite();
+    presentFrame();
 }
 
 static void draw() {
-    auto& d = M5Cardputer.Display;
-    d.startWrite();
+    auto& d = g_canvas;
     d.fillScreen(BLACK);
-    d.endWrite();
     drawHeader();
     drawBrowser();
     drawFooter();
@@ -925,6 +1118,33 @@ static void pollSeekKeys() {
     drawFooter();
 }
 
+static void pollBrowserNavKeys() {
+    if (g_show_help) return;
+    auto state = M5Cardputer.Keyboard.keysState();
+    int direction = 0;
+    for (char c : state.word) {
+        if (c == ';') direction = -1;
+        else if (c == '.') direction = +1;
+    }
+    if (direction == 0) {
+        g_nav_press_ms = 0;
+        return;
+    }
+    uint32_t now = millis();
+    if (g_nav_press_ms == 0) {
+        // Fresh press — fire once, then suppress until the initial-delay
+        // window has elapsed.
+        moveCursor(direction);
+        g_nav_press_ms = now;
+        g_last_nav_ms = now;
+        return;
+    }
+    if (now - g_nav_press_ms < 400) return;
+    if (now - g_last_nav_ms < 100) return;
+    moveCursor(direction);
+    g_last_nav_ms = now;
+}
+
 static void changeVolume(int delta) {
     g_volume += delta;
     if (g_volume < 0) g_volume = 0;
@@ -942,8 +1162,8 @@ static void changeFontNotch(int delta) {
     draw();
 }
 
-static void toggleMinimalChrome() {
-    g_chrome_minimal = !g_chrome_minimal;
+static void toggleDiagnostics() {
+    g_diagnostics_hidden = !g_diagnostics_hidden;
     draw();
 }
 
@@ -967,8 +1187,7 @@ static void jumpToPlaying() {
 }
 
 static void drawHelp() {
-    auto& d = M5Cardputer.Display;
-    d.startWrite();
+    auto& d = g_canvas;
     d.fillScreen(BLACK);
     d.setTextSize(1);
     d.setTextColor(COL_FILE_BRIGHT, BLACK);
@@ -987,7 +1206,7 @@ static void drawHelp() {
         " 1..0   jump to tenth",
         " = -    volume",
         " + _    font size",
-        " ` \\ ?  chrome wrap help",
+        " ` \\ ?  diags  wrap help",
     };
     int n = (int)(sizeof(lines) / sizeof(lines[0]));
     int y = 1;
@@ -996,7 +1215,7 @@ static void drawHelp() {
         d.print(lines[i]);
         y += 9;
     }
-    d.endWrite();
+    presentFrame();
 }
 
 static void showHelp() {
@@ -1007,7 +1226,7 @@ static void showHelp() {
 static void enterBatteryLowState() {
     stopPlayback();
 
-    auto& d = M5Cardputer.Display;
+    auto& d = g_canvas;
     d.fillScreen(BLACK);
     d.setTextSize(2);
     constexpr int CELL_W = 12, CELL_H = 16;  // size-2 character cell
@@ -1023,6 +1242,7 @@ static void enterBatteryLowState() {
     drawLine("Battery Empty",   y, 0xF800);          y += CELL_H + 16;
     drawLine("Charge with",     y, COL_HEADER_TXT);  y += CELL_H + 2;
     drawLine("power switch ON", y, COL_HEADER_TXT);
+    presentFrame();
 
     delay(BATTERY_LOW_TIMEOUT_MS);
     M5.Power.powerOff();
@@ -1032,6 +1252,10 @@ void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
     M5Cardputer.Display.setRotation(1);
+
+    // Create the back-buffer sprite once the display knows its rotation
+    // and resolution. All subsequent draws target this sprite.
+    g_canvas.createSprite(SCREEN_W, SCREEN_H);
 
     Serial.begin(115200);
     Serial.println("cardplayer: boot ok");
@@ -1053,6 +1277,13 @@ void setup() {
     g_audio_mutex = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(audioTask, "audio", AUDIO_TASK_STACK / sizeof(StackType_t),
                             nullptr, AUDIO_TASK_PRIO, &g_audio_task, AUDIO_TASK_CORE);
+
+    // Idle hooks per core tick a counter on every idle-task turn; the
+    // diagnostics poll samples each delta and normalises against the
+    // highest delta seen so far.
+    esp_register_freertos_idle_hook_for_cpu(idleHookCore0, 0);
+    esp_register_freertos_idle_hook_for_cpu(idleHookCore1, 1);
+
     pollBattery(true);
     draw();
 }
@@ -1078,8 +1309,6 @@ void loop() {
         } else {
             for (char c : state.word) {
                 switch (c) {
-                    case ';': moveCursor(-1); break;
-                    case '.': moveCursor(+1); break;
                     case ',': if (state.fn) skipTrack(-1); else ascend();   break;
                     case '/': if (state.fn) skipTrack(+1); else descend();  break;
                     case ' ': togglePause(); break;
@@ -1087,7 +1316,7 @@ void loop() {
                     case '-': changeVolume(-1); break;
                     case '+': changeFontNotch(+1); break;
                     case '_': changeFontNotch(-1); break;
-                    case '`':  toggleMinimalChrome(); break;
+                    case '`':  toggleDiagnostics(); break;
                     case '\\': toggleWrapNames(); break;
                     case '?':  showHelp(); break;
                     case '\'': jumpToPlaying(); break;
@@ -1105,6 +1334,7 @@ void loop() {
     }
 
     pollSeekKeys();
+    pollBrowserNavKeys();
 
     if (g_advance_pending) {
         g_advance_pending = false;
@@ -1119,7 +1349,10 @@ void loop() {
     }
     if (playing && millis() - g_last_progress_ms > 500) {
         g_last_progress_ms = millis();
-        if (!g_show_help) drawSlotProgress();
+        if (!g_show_help) {
+            drawSlotProgress();
+            presentFrame();
+        }
     }
     delay(10);
 }

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.0 — 2026-04-27
+
+- Browser updates no longer flash. All UI now renders into an off-screen back buffer and pushes to the panel in one operation, so pixels transition directly from the previous frame to the next without an intervening black fill.
+
+## 0.11.4 — 2026-04-27
+
+- Diagnostics row overhauled to surface device resources at a glance: stack peak, ring-buffer headroom, RAM use, and underrun count as numeric percentages, plus a per-core CPU graph (cyan core 0 / orange core 1) updated four times a second with ~17 s of history. CPU readings self-calibrate after one mostly-idle second per core.
+
+## 0.10.1 — 2026-04-27
+
+- Browser gains a scrollbar at the right edge of the directory column — thumb shows position and visible range, hidden when content fits. Holding `;` / `.` now auto-repeats: the first press fires immediately, then a short delay, then steady stepping while held.
+
 ## 0.9.0 — 2026-04-26
 
 - Footer redesigned as a single compact line: the playing track's name marquee-scrolls when too long for its slot, the progress bar carries play/pause state through its colour (slate-blue while playing, mid-grey while paused or stopped), and a teal volume bar sits at the right. Footer height halved from 16 px to 10 px, so the browser gains 6 px of vertical space. The hairline above the footer picks up the same slate-blue, framing the strip as a distinct region.
