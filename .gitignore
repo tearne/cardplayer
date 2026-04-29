@@ -2,3 +2,8 @@
 .vscode/
 CLAUDE.md
 changes/agent/
+managed_components/
+.dummy/
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults

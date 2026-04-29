@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.30 — 2026-04-28
+
+- Internal: Arduino-ESP32 framework now rebuilds cleanly with custom sdkconfig overrides. `CONFIG_FREERTOS_USE_TRACE_FACILITY=y` is now explicit (guaranteeing calibration-free CPU diagnostics regardless of upstream defaults), and a small pre-build patch script auto-applies an upstream-pending workaround so future config flags can be added without breaking the build.
+
+## 0.13.15 — 2026-04-28
+
+- Moved to Arduino-ESP32 v3 and the actively-maintained `arduino-audio-tools` audio library, retiring the in-house M4A demuxer. CPU readings in the diagnostics row now show real microsecond-accurate values from the first sample — no warmup before the numbers stabilise. Known regressions tracked as separate work: HE-AAC M4A files (typical iTunes Store downloads) currently fail to play, and FLAC has occasional underruns.
+
 ## 0.12.0 — 2026-04-27
 
 - Browser updates no longer flash. All UI now renders into an off-screen back buffer and pushes to the panel in one operation, so pixels transition directly from the previous frame to the next without an intervening black fill.
