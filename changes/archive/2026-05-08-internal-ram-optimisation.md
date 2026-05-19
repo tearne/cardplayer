@@ -86,3 +86,25 @@ Reserved (still-viable but currently not preferred because they cost flicker-fre
   1. **`setRingDepth` race condition.** M5.Speaker keeps a 2-deep wavinfo queue per channel; `playRaw()` returns but the speaker's DMA reads our buffer for ~70 ms after. `setRingDepth` calls `delete[] _buf` immediately on track change — corrupts memory the speaker is still reading from. Manifests later when an allocator hands the recycled region to a different caller.
   2. **No margin during FLAC after the chain.** `post_start` for FLAC after the chain shows 34 KB free / **15 KB largest contiguous**. Foxen's follow-on allocations during decode have no room.
 - 2026-04-29: Stopping build, returning to plan mode for replanning. Race condition is fixable but doesn't address the underlying tightness; canvas drop was raised as the technically-right call, and library swap (`schreibfaul1/ESP32-audioI2S`) was raised as a wider option to test before committing.
+- 2026-05-04: Replanning produced an eval (`eval-esp32-audioi2s`) which closed no-go (the alternative library requires PSRAM that this hardware doesn't have). Eval led to `audio-library-rollback` — rolled audio library back to ESP8266Audio + the in-house demuxer pre-migration. Rollback delivered far more than this change had been chasing: ~33 KB internal RAM and ~540 KB flash freed at boot, M4A `largest contiguous` jumped from 7 KB to ~28 KB, multi-format chain crashes resolved, FLAC underruns resolved. HE-AAC SBR remains unsupported (libhelix decoder appetite, hardware limit). Done-when items 2 and 3 met by the rollback; item 1 (HE-AAC) explicitly redrawn out of scope.
+- 2026-05-08: Resumed build to do item 4 (tap cleanup + version bump). Removing the taps tripped a stack canary panic on `ipc1` during boot — `Stack canary watchpoint triggered`, intermittent. Theory: the IPC task's 1024-byte stack default was hairline-marginal; cleanup shifted binary layout enough to flip the dice. Confirmed empirically with a `uxTaskGetStackHighWaterMark` probe at the diagnostic streams: `ipc1` peak usage was ~976 of 1024 bytes (4.7 % headroom) — and on a subsequent build peak drifted up to 1088 bytes, *above* the 1024 default. Without intervention, the firmware was a stochastic boot risk.
+- 2026-05-08: Bumped `CONFIG_ESP_IPC_TASK_STACK_SIZE` from 1024 to 2048 via `custom_sdkconfig`. Confirmed the override propagated through the framework rebuild (`framework-arduinoespressif32-libs/esp32s3/sdkconfig` shows `=2048`). On-device probe shows `ipc1 min_free=960 bytes` of the new 2048 — comfortable headroom. Boot is clean.
+- 2026-05-08: Side finding during the IPC bump work — `CONFIG_ARDUINO_RUNNING_CORE=0` was *not* propagating from `custom_sdkconfig` (sdkconfig still showed `=1`), even though the IPC bump on the same line block did propagate. Special handling for `ARDUINO_RUNNING_CORE` somewhere downstream of `custom_sdkconfig` is reverting it. Not a problem for us: the design we shipped (`audio on core 0, UI on core 1` from `core-split-investigation`) goes *with* the framework default, so the stale override was counterproductive. Removed the line from `platformio.ini`. The custom_sdkconfig mechanism is *not* broken in general; only `ARDUINO_RUNNING_CORE` has this quirk.
+
+## Conclusion
+
+Closed with substance and a couple of useful side-finds. The core intent — give the device enough internal-RAM headroom to make M4A and track-change reliable — was delivered, but largely via the parallel `audio-library-rollback` change rather than this change's own levers. Levers 1–3 (lazy decoders, streaming `stsz`, ring-depth trim) shipped in their original form; lever 4 (tap cleanup) just landed. The eval-and-rollback detour is captured in those changes' archives.
+
+HE-AAC SBR M4A redrawn from "in scope, blocked" to "explicitly out of scope on this hardware" — libhelix's contiguous-allocation appetite isn't addressable without different decoder or PSRAM, and we have neither.
+
+Side-find worth carrying forward: the `custom_sdkconfig` framework-rebuild mechanism is alive and well; only `ARDUINO_RUNNING_CORE` has special downstream handling that resets it. Anyone working on framework-config flags in the future should expect most flags to apply normally and pin-specific ones to need closer scrutiny.
+
+Final shipped version: `0.14.3`.
+
+### Proposed `CHANGELOG.md` entry
+
+```
+## 0.14.3 — 2026-05-08
+
+- Diagnostic memory taps removed from serial output — boot and steady-state are now quiet. Internal: `CONFIG_ESP_IPC_TASK_STACK_SIZE` raised from the framework default 1024 to 2048 to give comfortable headroom for an ESP-IDF system task that was peaking at ~976 bytes during boot. The 1024 default was hairline-marginal and would intermittently trip a stack-canary panic on this firmware/hardware combination.
+```

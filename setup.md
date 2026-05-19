@@ -59,6 +59,8 @@ groups
 
 `dialout` should appear in the list.
 
+> **Can't log out right now?** Run `newgrp dialout` in your current terminal. That starts a sub-shell where `dialout` is active immediately, so `pio run -t upload` works without logging out. `exit` returns to the parent shell. Only that shell (and its children) gets the group — other terminals still need their own `newgrp` until your next login. For a one-off command, `sg dialout -c 'pio run -t upload'` works the same way.
+
 ### 2b. Install PlatformIO's udev rules
 
 These tell the kernel to grant access to common dev boards, including ESP32-S3.

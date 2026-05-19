@@ -1,119 +1,340 @@
-// Pipes decoded PCM from arduino-audio-tools into M5.Speaker (ES8311 codec).
-// The decoder writes interleaved 16-bit PCM in chunks; we batch into a
-// triple-buffer ring and hand each full buffer to playRaw(). Mono / stereo
-// handling matches the original ESP8266Audio implementation: stereo down-
-// mixed to mono since the speaker is mono.
+// Pipes decoded PCM from ESP8266Audio into M5.Speaker (ES8311 codec).
+// Stereo down-mixed to mono since the speaker is mono. A pre-buffer
+// between ConsumeSample and the speaker queue lets the decoder run ahead
+// of audible playback by ~150 ms so the waveform visualisation has
+// meaningful look-ahead. The speaker's own 2-deep wavinfo queue is still
+// the rate-limiter; the pre-buffer just decouples decoder pacing from
+// speaker submission.
 #pragma once
 
-#include "AudioTools/CoreAudio/AudioOutput.h"
+#include <AudioOutput.h>
 #include <M5Cardputer.h>
 
-class AudioOutputM5CardputerSpeaker : public audio_tools::AudioOutput {
+#include <cstring>
+
+#include <arduinoFFT.h>
+
+// Spectrum tap — 256-pt real FFT once per 256 incoming mono samples.
+// Magnitudes log-grouped into SPEC_BINS visible bands and accumulated into
+// the in-progress display column. Column commits at SPEC_COL_SAMPLES
+// boundaries, advancing a column ring read by the heatmap render path.
+static constexpr int      SPEC_FFT_SIZE     = 256;
+static constexpr int      SPEC_BINS         = 28;
+// Ring is wider than the screen (240 px) so the audio task's writer and
+// the UI task's reader can never touch the same slot. With SPEC_COLS ==
+// SCREEN_W there's no headroom: a 1-col lag in disp_abs caused the
+// latest write to wrap into x=0. Doubling the ring puts 240 cols of
+// margin between writer and reader.
+static constexpr int      SPEC_COLS         = 480;
+// ~8.3 ms per column at 44.1 kHz ≈ 240 cols × 8.3 ms = 2 s on screen.
+// Floor is SPEC_FFT_SIZE (256) — below that, columns commit faster than
+// FFTs fire and some render as silence.
+static constexpr uint32_t SPEC_COL_SAMPLES  = 368;  // ~8.3 ms at 44.1 kHz
+
+struct SpectrumRing {
+    uint8_t  intensity[SPEC_COLS][SPEC_BINS] = {};
+    volatile uint32_t head     = 0;  // next column to write
+    volatile uint64_t abs_head = 0;  // monotonic count
+};
+
+// Waveform ring tap — per-column min/max peaks of the most recently
+// decoded mono samples. Audio task writes; UI task reads. Per-cell
+// update is non-atomic but the visible glitch is one column wide at
+// most — acceptable for visualisation.
+// Wider than screen (= 240 px) so the visible 240-col viewport has room
+// to slide over the buffer without falling off the ends. New cols still
+// arrive at audio rate; the viewport position is driven by wall-clock
+// time so display scroll stays smooth even when the data head jitters.
+static constexpr int WV_COLS = 480;
+struct WaveformRing {
+    int8_t  min_v[WV_COLS] = {};
+    int8_t  max_v[WV_COLS] = {};
+    volatile uint32_t head = 0;       // next column to write (modular index)
+    volatile uint64_t abs_head = 0;   // monotonic count of all columns ever written
+};
+
+class AudioOutputM5CardputerSpeaker : public AudioOutput {
 public:
     AudioOutputM5CardputerSpeaker() = default;
     explicit AudioOutputM5CardputerSpeaker(m5::Speaker_Class* spk) : _spk(spk) {}
 
-    // Late-bound speaker pointer; used when the global instance is default-
-    // constructed at static init and the actual speaker reference can't be
-    // taken until M5Cardputer has been initialised.
     void setSpeaker(m5::Speaker_Class* spk) { _spk = spk; }
 
-    bool begin() override {
-        if (!_buf) setRingDepth(DEFAULT_RING_COUNT);
-        _running = true;
+    const WaveformRing& waveformRing() const { return _wv; }
+    const SpectrumRing& spectrumRing() const { return _spec; }
+
+    // One-time FFT init. Safe to call before begin(); idempotent.
+    void initSpectrum() {
+        if (_spec_inited) return;
+        _spec_fft = new ArduinoFFT<float>(_spec_real, _spec_imag,
+                                          SPEC_FFT_SIZE, 44100.0f);
+        _spec_inited = true;
+    }
+
+    // Waveform commits at the same sample cadence as the spectrum so
+    // both rings advance in lockstep and a single display cursor can
+    // drive both views. The lookahead-driven calibration that used to
+    // live here is gone with the playhead-at-20 % design.
+    int waveformSamplesPerCol() const { return SPEC_COL_SAMPLES; }
+
+    uint32_t sampleRate() const { return hertz ? hertz : 44100; }
+
+    bool begin() override { return true; }
+
+    bool SetChannels(int chan) override {
+        bool result = AudioOutput::SetChannels(chan);
+        if (_log_pending) {
+            Serial.printf("format: rate=%u bits=%u ch=%u\n", hertz, bps, channels);
+            _log_pending = false;
+        }
+        return result;
+    }
+
+    // ConsumeSample now writes to the pre-buffer (a flat circular ring of
+    // int16 mono samples). Returns false when the pre-buffer is full; the
+    // decoder retries — which yields control so the audio task can run
+    // shipBuffered() in the gap.
+    bool ConsumeSample(int16_t sample[2]) override {
+        if (!_spk) return false;
+        if (_prebuf_count >= PREBUF_SAMPLES) {
+            return false;  // pre-buffer full — caller retries after shipping
+        }
+
+        int16_t mono;
+        if (channels == 1) {
+            mono = sample[0];
+        } else {
+            int32_t sum = (int32_t)sample[0] + (int32_t)sample[1];
+            mono = (int16_t)(sum / 2);
+        }
+        _prebuf[_prebuf_head] = mono;
+        _prebuf_head = (_prebuf_head + 1) % PREBUF_SAMPLES;
+        _prebuf_count++;
+        _samples_consumed++;
+
+        // Waveform ring update — same shape as before but tapping
+        // pre-buffer ingress (= deepest available future).
+        if (mono < _wv_min) _wv_min = mono;
+        if (mono > _wv_max) _wv_max = mono;
+        // Visualisation taps (waveform + spectrum) are suppressed for a
+        // window after resetVisualisation so the decoder's pre-seek
+        // sample pipeline drains without contaminating either ring.
+        // Both taps gated by the same counter so the two views stay
+        // in lockstep across a reset.
+        if (_viz_suppress_samples > 0) {
+            _viz_suppress_samples--;
+            return true;
+        }
+
+        if (++_wv_count >= waveformSamplesPerCol()) {
+            uint32_t h = _wv.head;
+            _wv.min_v[h] = (int8_t)(_wv_min >> 8);
+            _wv.max_v[h] = (int8_t)(_wv_max >> 8);
+            _wv.head = (h + 1) % WV_COLS;
+            _wv.abs_head++;
+            _wv_min = INT16_MAX;
+            _wv_max = INT16_MIN;
+            _wv_count = 0;
+        }
+
+        if (_spec_inited) {
+            _spec_samples[_spec_fill++] = (float)mono * (1.0f / 32768.0f);
+            if (_spec_fill == SPEC_FFT_SIZE) {
+                computeSpectrum();
+                _spec_fill = 0;
+            }
+            if (++_spec_col_samples >= SPEC_COL_SAMPLES) {
+                commitSpectrumColumn();
+                _spec_col_samples = 0;
+            }
+        }
         return true;
     }
-    void end()   override { _running = false; }
 
-    // Reallocate the ring at a new depth. Caller must ensure no audio is
-    // playing (audioTask inactive) when this is called — the buffer
-    // contents are discarded.
-    void setRingDepth(size_t depth) {
-        if (depth == _ring_count && _buf) return;
-        if (_buf) { delete[] _buf; _buf = nullptr; }
-        _ring_count = depth;
-        _buf = new int16_t[_ring_count * BUF_SIZE];
-        _idx = 0;
-        _ring = 0;
+    // Submit one slot's worth of pre-buffered samples to the speaker if
+    // we have at least that many ready. Called from the audio task on
+    // every iteration. Blocks inside playRaw when speaker's queue is
+    // full — that's the rate-limiter, same as the original design.
+    void shipBuffered() {
+        if (!_spk) return;
+        if (_prebuf_count < BUF_SIZE) return;
+        copyAndSubmit(BUF_SIZE);
     }
 
-    void setAudioInfo(audio_tools::AudioInfo info) override {
-        // setAudioInfo is called once per stream start, and again whenever
-        // the format changes mid-stream. Log on any actual change.
-        if (info.sample_rate != _hertz || info.channels != _channels
-            || info.bits_per_sample != _bits) {
-            _hertz    = info.sample_rate;
-            _channels = info.channels;
-            _bits     = info.bits_per_sample;
-            Serial.printf("format: rate=%u bits=%u ch=%u\n",
-                          (unsigned)_hertz, (unsigned)_bits, (unsigned)_channels);
-        }
-        audio_tools::AudioOutput::setAudioInfo(info);
-    }
-
-    size_t write(const uint8_t* data, size_t len) override {
-        if (!_running || _bits != 16 || _channels < 1 || _channels > 2) return len;
-        const int16_t* samples = reinterpret_cast<const int16_t*>(data);
-        size_t frames = len / (sizeof(int16_t) * _channels);
-        for (size_t i = 0; i < frames; ++i) {
-            int16_t mono;
-            if (_channels == 1) {
-                mono = samples[i];
-            } else {
-                int32_t sum = (int32_t)samples[i * 2] + (int32_t)samples[i * 2 + 1];
-                mono = (int16_t)(sum / 2);
-            }
-            _buf[_ring * BUF_SIZE + _idx++] = mono;
-            if (_idx >= BUF_SIZE) flush();
-        }
-        return len;
-    }
-
+    // Submit whatever's left in the pre-buffer, even a partial slot.
+    // Used on stop / track change.
     void flush() override {
-        if (_idx == 0 || !_spk) return;
-        // Underrun condition: speaker drained before we got here.
-        bool was_drained = _submitted_once && !_spk->isPlaying();
-        if (was_drained) ++_underruns;
+        if (_prebuf_count == 0 || !_spk) return;
+        size_t n = _prebuf_count;
+        if (n > BUF_SIZE) n = BUF_SIZE;
+        copyAndSubmit(n);
+        if (_prebuf_count >= BUF_SIZE) {
+            // Pre-buffer had more than one slot's worth left — drain
+            // remainder so stop/skip empties the path.
+            copyAndSubmit(BUF_SIZE);
+        }
+    }
 
-        // Submit on channel 0, no preemption. M5Speaker keeps a 2-deep
-        // wavinfo queue per channel; if both slots are busy the call
-        // blocks inside `_set_next_wav` until one frees. That blocking
-        // time is the natural "buffer full" signal — high wait = lots of
-        // headroom, low wait = on the edge.
-        constexpr int  PLAY_CHANNEL = 0;
-        constexpr bool PREEMPT      = false;
-        constexpr uint32_t REPEAT   = 1;
-        uint32_t t0 = micros();
-        _spk->playRaw(&_buf[_ring * BUF_SIZE], _idx, _hertz, false, REPEAT,
-                      PLAY_CHANNEL, PREEMPT);
-        _last_wait_us = was_drained ? 0 : (micros() - t0);
-        _submitted_once = true;
-        _ring = (_ring + 1) % _ring_count;
-        _idx = 0;
+    bool stop() override {
+        flush();
+        while (_spk && _spk->isPlaying()) vTaskDelay(1 / portTICK_PERIOD_MS);
+        return true;
+    }
+
+    // Discard everything in flight from decoder to speaker. Used on
+    // stop / skip so the user doesn't hear up to ~220 ms of stale audio
+    // after pressing the key.
+    void hardFlush() {
+        _prebuf_head  = 0;
+        _prebuf_tail  = 0;
+        _prebuf_count = 0;
+        resetVisualisation();
+        if (_spk) _spk->stop();
+    }
+
+    // Wipe both visualisation rings without touching the pre-buffer or
+    // speaker. Used on intra-track seeks where we want the overlays to
+    // blank but audio to continue from its existing pre-buffer. Also
+    // suppresses tap updates for ~200 ms so pre-seek audio still sitting
+    // in the decoder's internal buffers doesn't seed the rings with
+    // stale content as it flows through ConsumeSample.
+    void resetVisualisation() {
+        memset(_wv.min_v, 0, sizeof(_wv.min_v));
+        memset(_wv.max_v, 0, sizeof(_wv.max_v));
+        _wv_min = INT16_MAX;
+        _wv_max = INT16_MIN;
+        _wv_count = 0;
+        memset(_spec.intensity, 0, sizeof(_spec.intensity));
+        for (int b = 0; b < SPEC_BINS; b++) _spec_accum[b] = 0.0f;
+        _spec_fill = 0;
+        _spec_col_samples = 0;
+        _viz_suppress_samples = sampleRate() / 5;  // ~200 ms
     }
 
     uint32_t underruns()      const { return _underruns; }
     uint32_t lastWaitMicros() const { return _last_wait_us; }
+    size_t   prebufSamples()  const { return _prebuf_count; }
+
+    void resetFormatLog() { _log_pending = true; _samples_consumed = 0; }
+    uint32_t samplesConsumed() const { return _samples_consumed; }
 
 private:
-    // Ring depth governs how much overrun the decoder can put in front of
-    // the speaker before the speaker drains back to empty. FLAC frames are
-    // 4096–8192 samples and arrive in bursts; 3 slots × 1536 samples drained
-    // empty between bursts and underran. 6 slots gives the decoder room.
-    // Stored on the heap so depth can be reduced per-track for formats with
-    // large decoder workspaces (HE-AAC SBR), reclaiming ~3 KB per slot.
-    static constexpr size_t BUF_SIZE = 1536;
-    static constexpr size_t DEFAULT_RING_COUNT = 6;
+    // Run the 256-pt FFT on the latest _spec_samples window and add
+    // log-grouped magnitudes into the in-progress display column.
+    void computeSpectrum() {
+        for (int i = 0; i < SPEC_FFT_SIZE; i++) {
+            _spec_real[i] = _spec_samples[i];
+            _spec_imag[i] = 0.0f;
+        }
+        _spec_fft->windowing(FFTWindow::Hann, FFTDirection::Forward);
+        _spec_fft->compute(FFTDirection::Forward);
+        _spec_fft->complexToMagnitude();
+        // Log-group bins 1..N/2-1 (skip DC) into SPEC_BINS visible bands.
+        const int half = SPEC_FFT_SIZE / 2;
+        const float log_lo = logf(1.0f);
+        const float log_hi = logf((float)(half - 1));
+        const float step   = (log_hi - log_lo) / SPEC_BINS;
+        int b = 0;
+        float band_max = 0.0f;
+        float next_edge = expf(log_lo + step);
+        for (int k = 1; k < half && b < SPEC_BINS; k++) {
+            // +6 dB/oct tilt: multiply by k so music's natural low-end
+            // bias doesn't park the bottom bands at one colour.
+            float mag = _spec_real[k] * (float)k;
+            if (mag > band_max) band_max = mag;
+            if ((float)k >= next_edge) {
+                if (band_max > _spec_accum[b]) _spec_accum[b] = band_max;
+                b++;
+                band_max = 0.0f;
+                next_edge = expf(log_lo + step * (b + 1));
+            }
+        }
+        if (b < SPEC_BINS && band_max > _spec_accum[b]) {
+            _spec_accum[b] = band_max;
+        }
+    }
+
+    // Commit the accumulated column into the ring. Magnitudes are mapped
+    // to 0..255 via a log curve so a wide dynamic range fits the LUT.
+    void commitSpectrumColumn() {
+        // 0 dB reference = full-scale single-bin magnitude (= N/2 for an
+        // un-windowed sine). Typical music content lands well below this,
+        // spreading nicely across the LUT instead of saturating at yellow.
+        constexpr float REF = SPEC_FFT_SIZE / 2.0f;
+        constexpr float FLOOR_DB = -80.0f;
+        uint32_t h = _spec.head;
+        for (int b = 0; b < SPEC_BINS; b++) {
+            float m  = _spec_accum[b] / REF;
+            float db = (m > 1e-8f) ? 20.0f * log10f(m) : -160.0f;
+            if (db < FLOOR_DB) db = FLOOR_DB;
+            if (db > 0.0f)     db = 0.0f;
+            int v = (int)((db - FLOOR_DB) * (255.0f / -FLOOR_DB));
+            _spec.intensity[h][b] = (uint8_t)v;
+            _spec_accum[b] = 0.0f;
+        }
+        _spec.head = (h + 1) % SPEC_COLS;
+        _spec.abs_head++;
+    }
+
+    void copyAndSubmit(size_t n) {
+        // Copy n samples from pre-buffer tail into the next _buf slot
+        // (contiguous — playRaw needs it that way), then submit.
+        for (size_t i = 0; i < n; i++) {
+            _buf[_ring][i] = _prebuf[_prebuf_tail];
+            _prebuf_tail = (_prebuf_tail + 1) % PREBUF_SAMPLES;
+        }
+        _prebuf_count -= n;
+
+        bool was_drained = _submitted_once && !_spk->isPlaying();
+        if (was_drained) ++_underruns;
+
+        constexpr int  PLAY_CHANNEL = 0;
+        constexpr bool PREEMPT      = false;
+        constexpr uint32_t REPEAT   = 1;
+        uint32_t t0 = micros();
+        _spk->playRaw(_buf[_ring], n, hertz, false, REPEAT, PLAY_CHANNEL, PREEMPT);
+        _last_wait_us = was_drained ? 0 : (micros() - t0);
+        _submitted_once = true;
+        _ring = (_ring + 1) % RING_COUNT;
+    }
+
+    // 3 slots × 1536 samples × 2 bytes ≈ 9 KB. Used only as the
+    // contiguous staging area for playRaw; round-robin works because
+    // by the time we cycle back to a slot, playRaw will have blocked
+    // until the speaker is no longer holding it.
+    static constexpr size_t BUF_SIZE   = 1536;
+    static constexpr size_t RING_COUNT = 3;
+
+    // Pre-buffer: ~150 ms at 44.1 kHz mono = 6615 samples. Sized a bit
+    // larger so a full-slot copy doesn't immediately empty it.
+    static constexpr size_t PREBUF_SAMPLES = 7000;  // ~158 ms at 44.1 kHz
+
     m5::Speaker_Class* _spk = nullptr;
-    int16_t* _buf = nullptr;
-    size_t   _ring_count = 0;
-    size_t   _idx = 0;
+    int16_t  _buf[RING_COUNT][BUF_SIZE]{};
     size_t   _ring = 0;
+    int16_t  _prebuf[PREBUF_SAMPLES]{};
+    size_t   _prebuf_head  = 0;   // next write
+    size_t   _prebuf_tail  = 0;   // next read
+    size_t   _prebuf_count = 0;
     uint32_t _underruns = 0;
     uint32_t _last_wait_us = 0;
     bool     _submitted_once = false;
-    bool     _running = true;
-    uint32_t _hertz = 0;
-    uint16_t _channels = 0;
-    uint8_t  _bits = 0;
+    bool     _log_pending = false;
+    WaveformRing _wv {};
+    int16_t  _wv_min = INT16_MAX;
+    int16_t  _wv_max = INT16_MIN;
+    int      _wv_count = 0;
+    uint32_t _samples_consumed = 0;  // reset on resetFormatLog()
+
+    // Spectrum tap state.
+    SpectrumRing _spec {};
+    bool     _spec_inited     = false;
+    float    _spec_samples[SPEC_FFT_SIZE]     = {};
+    float    _spec_real[SPEC_FFT_SIZE]        = {};
+    float    _spec_imag[SPEC_FFT_SIZE]        = {};
+    float    _spec_accum[SPEC_BINS]           = {};
+    int      _spec_fill              = 0;
+    int      _spec_col_samples       = 0;
+    uint32_t _viz_suppress_samples   = 0;
+    ArduinoFFT<float>* _spec_fft = nullptr;
 };

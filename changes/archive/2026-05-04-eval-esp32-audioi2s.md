@@ -12,7 +12,7 @@ If ESP32-audioI2S gives us enough headroom to make M4A comfortable *and* preserv
 
 ### Shape: a separate, stripped-down build
 
-The eval lives as a second PlatformIO environment (e.g. `eval-audioi2s`) alongside `cardputer-adv`. Its source is a small `main.cpp` in `eval/audioi2s/` that does nothing but: bring up M5Unified for the codec/display, mount the SD, open the reference M4A, drive ESP32-audioI2S to play it, and emit our diagnostic tap. No browser, no UI, no track-change, no diagnostics row.
+The eval lives as a second PlatformIO environment (e.g. `eval-audioi2s`) alongside `cardputer-adv`. Its source is a small `main.cpp` in `src/eval/audioi2s/` that does nothing but: bring up M5Unified for the codec/display, mount the SD, open the reference M4A, drive ESP32-audioI2S to play it, and emit our diagnostic tap. No browser, no UI, no track-change, no diagnostics row.
 
 The current production build is untouched — the eval is comparison data, not a swap.
 
@@ -43,8 +43,8 @@ No map edits. The audio nodes in `map.md` are already stale from the v3 migratio
 ## Plan
 
 - [x] **Gate: verify HE-AAC SBR support in ESP32-audioI2S** before building anything. Read the library's source / docs / known-limitations issues. If SBR isn't supported, stop the change here and write the Conclusion saying the eval isn't worth running.
-- [x] Add `eval-audioi2s` environment to `platformio.ini`. Same board / framework / sdkconfig as `cardputer-adv`; `lib_deps` swaps audio-tools for ESP32-audioI2S; `src_filter` excludes `src/` and includes `eval/audioi2s/`.
-- [x] Write `eval/audioi2s/main.cpp`: bring up M5Unified (display + ES8311 codec), mount SD, hard-code the path to the reference M4A, hand I2S to ESP32-audioI2S, drive playback, log the existing `[mem.fast]` tap (boot / post_start / 10 ms taps for first 2 s / steady-state).
+- [x] Add `eval-audioi2s` environment to `platformio.ini`. Same board / framework / sdkconfig as `cardputer-adv`; `lib_deps` swaps audio-tools for ESP32-audioI2S; `src_filter` excludes `src/` and includes `src/eval/audioi2s/`.
+- [x] Write `src/eval/audioi2s/main.cpp`: bring up M5Unified (display + ES8311 codec), mount SD, hard-code the path to the reference M4A, hand I2S to ESP32-audioI2S, drive playback, log the existing `[mem.fast]` tap (boot / post_start / 10 ms taps for first 2 s / steady-state).
 - [ ] Build and flash; capture serial output for the reference HE-AAC M4A; record readings in Notes.
 - [ ] Smoke-test: swap the hard-coded path to a known FLAC and an MP3, build/flash/capture for each. Confirms ESP32-audioI2S handles our other formats.
 - [ ] Compare against the decision criteria in the Approach. Write the outcome (big win / modest / no-go) into Notes.
@@ -59,7 +59,7 @@ Per the library's README codec table: `aacp` (AAC+ / HE-AAC) on ESP32-S3 / P4 in
 
 ### 2026-04-30 — eval-audioi2s env added, eval main written, build succeeds
 
-`platformio.ini` now has `[env:eval-audioi2s]` (extends `cardputer-adv`, swaps `lib_deps` to ESP32-audioI2S, `build_src_filter` includes only `eval/audioi2s/`). `eval/audioi2s/main.cpp` plays a hard-coded reference file via ESP32-audioI2S after letting `M5.Speaker.begin()` configure the ES8311 codec (then `end()` to release I2S — the disable callback is a no-op so codec stays powered).
+`platformio.ini` now has `[env:eval-audioi2s]` (extends `cardputer-adv`, swaps `lib_deps` to ESP32-audioI2S, `build_src_filter` includes only `src/eval/audioi2s/`). `src/eval/audioi2s/main.cpp` plays a hard-coded reference file via ESP32-audioI2S after letting `M5.Speaker.begin()` configure the ES8311 codec (then `end()` to release I2S — the disable callback is a no-op so codec stays powered).
 
 Two build-time observations:
 - **Static RAM 19.3%** (63 KB) vs production's 21.4% (70 KB) — ~7 KB less in `.bss`. Modest as predicted, but earlier than the on-device readings will land.
@@ -69,14 +69,26 @@ ESP32-audioI2S uses **libfaad** for AAC, not libhelix. Confirms the earlier "AAC
 
 One build snag worth recording: ESP32-audioI2S references `CORE_DEBUG_LEVEL` (a standard Arduino-ESP32 build macro). The custom-sdkconfig framework rebuild doesn't emit it, so the build failed until we added `-DCORE_DEBUG_LEVEL=0` to the eval env's flags.
 
-### Resume marker
+### 2026-05-04 — alternate-main layout fix
 
-Next unticked task in the Plan is "Build and flash; capture serial output for the reference HE-AAC M4A". Build is already green — only flash + on-device capture remains. To resume:
+First flash attempt failed with linker errors: `multiple definition of setup()/loop()` against a generated `.dummy/sketch.cpp`. Cause: when `build_src_filter` redirects entirely outside `src/`, the pioarduino platform sees an empty sketch tree and injects `.dummy/sketch.cpp` to keep the Arduino build legal — which then collides with our real `setup()`/`loop()`. Excluding the dummy with another filter line doesn't help; the platform regenerates it after filtering.
 
-```
-pio run -e eval-audioi2s -t upload
-pio device monitor -e eval-audioi2s
-```
+Fix is the canonical "multiple mains in one project" pattern: keep alternate mains under `src/` and use per-env `build_src_filter` to pick exactly one. Moved `eval/audioi2s/` → `src/eval/audioi2s/`; `cardputer-adv` now filters `+<*> -<eval/>`, `eval-audioi2s` filters `-<*> +<eval/audioi2s/>`. Layout note added inline in `platformio.ini` with a reference link, since that's where the trap will be hit again. Reference: <https://community.platformio.org/t/managing-multiple-main-cpp-files-in-one-project-src-filter-alternative/30788>.
 
-Capture from boot through `[mem] post_start` and 5 s of steady-state, paste back, then we have the headline data point against the decision criteria.
+### 2026-05-04 — flash attempt: no-go on hardware grounds
 
+First flash succeeded; first boot printed `OOM: failed to allocate 720896 bytes for AudioBuffer` and halted. ESP32-audioI2S allocates a 704 KB AudioBuffer at startup, presumed to live in PSRAM. The Cardputer ADV's StampS3 module is ESP32-S3FN8 — 8 MB flash, no PSRAM. The library's README documents PSRAM as a hard requirement. The `setBufsize` knob doesn't exist in this version (compile error confirmed), and even with a smaller buffer the library is architected around PSRAM availability for decoder state.
+
+This trips decision criterion #3 — *no-go: library fails its own way*. The on-device heap-comparison readings were never collected because the OOM at startup is definitive. Smoke-tests of FLAC and MP3 are moot.
+
+Side finding: the production code's `g_canvas.setPsram(true)` (`src/main.cpp:1371`) silently falls back to internal RAM on this hardware. The canvas is therefore one of the loudest current consumers of the internal-RAM headroom we've been trying to claw back — relevant to whatever path supersedes this eval.
+
+## Conclusion
+
+No-go. ESP32-audioI2S is not viable on Cardputer ADV: the library requires PSRAM and this hardware has none. Eval terminated before the heap-comparison stage; the OOM at the library's startup allocation was a definitive answer in itself.
+
+The path forward redirects to a different lever: the new change `audio-library-rollback.md` rolls the audio library back from `pschatzmann/arduino-audio-tools` to `earlephilhower/ESP8266Audio` (which doesn't require PSRAM and was the project's pre-v0.13.15 library). That's a targeted reversal of the v3 migration's audio-library swap while keeping the platform plumbing.
+
+Eval scaffold torn down with this archive: `[env:eval-audioi2s]` removed from `platformio.ini`, `src/eval/audioi2s/` deleted, the layout-note comment block removed (it was a build-system gotcha specific to the eval env's empty-`src/`-tree pattern, not relevant after the env is gone). The PlatformIO multiple-mains reference link from that comment is preserved here for the next time the trap surfaces: <https://community.platformio.org/t/managing-multiple-main-cpp-files-in-one-project-src-filter-alternative/30788>.
+
+No version bump, no `CHANGELOG.md` entry — the production firmware was never affected.
