@@ -49,8 +49,7 @@ static constexpr int WV_COLS = 480;
 struct WaveformRing {
     int8_t  min_v[WV_COLS] = {};
     int8_t  max_v[WV_COLS] = {};
-    volatile uint32_t head = 0;       // next column to write (modular index)
-    volatile uint64_t abs_head = 0;   // monotonic count of all columns ever written
+    volatile uint32_t head = 0;  // next column to write (modular index)
 };
 
 class AudioOutputM5CardputerSpeaker : public AudioOutput {
@@ -131,7 +130,6 @@ public:
             _wv.min_v[h] = (int8_t)(_wv_min >> 8);
             _wv.max_v[h] = (int8_t)(_wv_max >> 8);
             _wv.head = (h + 1) % WV_COLS;
-            _wv.abs_head++;
             _wv_min = INT16_MAX;
             _wv_max = INT16_MIN;
             _wv_count = 0;

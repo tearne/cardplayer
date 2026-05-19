@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.21.11 — 2026-05-19
+
+- Panel SPI clock raised 40 → 80 MHz, halving display push duration (~8.5 → ~4.5 ms measured). Modest visible improvement to heatmap tearing; main benefit is lower main-loop CPU cost during visualisation playback.
+
+## 0.21.3 — 2026-05-19
+
+- Waveform and heatmap overlays can now show simultaneously. `Ctrl+W` and `Ctrl+H` are independent toggles; both-on gives a stacked dual layout (waveform 2/5 on top, heatmap 3/5 below) time-aligned via a single shared wall-clock cursor. The waveform's previous look-ahead and playhead-at-20 % design is gone — both views now read audio up to the right edge.
+- New "Auto heatmap" Settings toggle mirrors "Auto waveform"; either or both open at non-paused track start.
+- Heatmap time window narrowed to ~2 s on screen.
+
 ## 0.20.27 — 2026-05-18
 
 - `` ` `` now toggles the diagnostics row while a visualisation overlay (waveform or heatmap) is up, instead of dismissing the overlay. Diagnostics is a natural companion to a running visualisation; the previous behaviour treated it as an exit shortcut.

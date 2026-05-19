@@ -29,7 +29,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.21.3";
+static constexpr const char* APP_VERSION = "0.21.11";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -167,6 +167,11 @@ static constexpr uint16_t COL_SEARCH_FRAME = 0x652D;  // slate-green
 static M5Canvas g_canvas;
 static inline void presentFrame() { g_canvas.pushSprite(&M5Cardputer.Display, 0, 0); }
 
+// Visualisation-overlay active flags. Full state (shared cursor etc.)
+// lives further down with the rest of the visualisation block.
+static bool g_waveform_active = false;
+static bool g_heatmap_active  = false;
+
 // Push only rows [y, y + h) of the canvas to the panel. The canvas is at
 // 8 bpp (RGB332) and the panel is 16 bpp (RGB565), so we can't pushImage
 // the raw buffer — pushSprite handles the format conversion. Set a clip
@@ -178,8 +183,8 @@ static inline void presentRows(int y, int h) {
     g_canvas.pushSprite(&M5Cardputer.Display, 0, 0);
     M5Cardputer.Display.clearClipRect();
     // Sync to panel commit so the next compose pass doesn't race the
-    // panel still reading from canvas. Costs ~16 ms but eliminates the
-    // back-to-back tearing seen during heatmap column-rate pushes.
+    // panel still reading from canvas. Eliminates the DMA/canvas-write
+    // race that caused tearing during heatmap column-rate pushes.
     M5Cardputer.Display.waitDisplay();
 }
 
@@ -307,8 +312,8 @@ static int                   g_top    = 0;
 // how fast or slow renders fire. Bursty FFT writes don't translate into
 // bursty display motion; render rate caps translate into 1-or-2-pixel
 // steps instead of accumulating lag that would eventually wrap the ring.
-static bool     g_waveform_active = false;
-static bool     g_heatmap_active  = false;
+// g_waveform_active / g_heatmap_active are declared earlier (above
+// presentRows) so the push-duration instrumentation can see them.
 static double   g_viz_disp_abs    = 0.0;
 static uint32_t g_viz_prev_us     = 0;  // 0 = re-anchor on next poll
 static uint64_t g_viz_last_rendered_abs = ~(uint64_t)0;
@@ -2815,6 +2820,11 @@ void setup() {
     M5Cardputer.begin(cfg, true);
     M5Cardputer.Display.setRotation(1);
     M5Cardputer.Display.setBrightness(userBrightness());
+    // M5GFX's autodetect inits the Cardputer panel SPI at 40 MHz. We
+    // override after begin() — the bus reconfigures on next transaction.
+    // Walking up to narrow the heatmap push window vs panel scan tear.
+    static constexpr uint32_t PANEL_SPI_HZ = 80000000;
+    M5Cardputer.Display.getPanel()->getBus()->setClock(PANEL_SPI_HZ);
     g_last_activity_ms = millis();
 
     Serial.begin(115200);

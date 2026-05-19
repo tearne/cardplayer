@@ -61,3 +61,9 @@ Both visualisations render simultaneously, time-aligned, with no regressions to 
 - 0.21.0 flashed and worked. User asked to zoom in. 0.21.1: `SPEC_COL_SAMPLES` 552 → 368 (3 s → 2 s on screen).
 - 0.21.2: added "Auto heatmap" Settings toggle mirroring "Auto waveform" — independent persisted (`autohm`) flag, opens the heatmap overlay at non-paused track start. Track-start hook generalised to apply either or both `g_auto_*` flags.
 - 0.21.3: removed hairline divider between waveform and heatmap in dual mode; heatmap gets the row back.
+
+## Conclusion
+
+Both views render simultaneously, time-aligned via a shared wall-clock-paced cursor, at 2 s on screen. Waveform's look-ahead and playhead are gone; both rings commit at the spectrum's column rate. Auto-show is per-view (Auto waveform / Auto heatmap), and `Ctrl+W` / `Ctrl+H` are independent. Diagnostics-on layout left as-is — squished but usable. No divider between views.
+
+**Documentation impact:** new Heatmap Visualisation node under Browser; Waveform Visualisation needs updates (no playhead, no look-ahead, no mutual exclusion). Negotiate post-archive.
