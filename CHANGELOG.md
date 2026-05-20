@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.58 — 2026-05-20
+
+- Visualisation no longer blanks on track jumps or intra-track seeks. The previously-rendered heatmap / waveform content stays on screen and scrolls off naturally as new audio arrives.
+
 ## 0.21.57 — 2026-05-20
 
 - Visualisation tear minimised. Render task now driven by `esp_timer` at the empirically-calibrated panel scan period (~16780 µs ≈ 59.6 Hz), so pushes consistently land at the same scan phase = stationary tear. With 1 column per render at 4 s on screen, the tear shift drops to 1 pixel — essentially imperceptible. `Ctrl+T` toggles a vertical-bar test pattern for per-device panel-rate calibration. Diagnostics row updates restored during visualisation via a lightweight header-rows-only push.

@@ -29,7 +29,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.21.57";
+static constexpr const char* APP_VERSION = "0.21.58";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -618,10 +618,9 @@ static void stopPlayback() {
     // stop / skip feels instant. Without this the ~220 ms of audio in the
     // path would play out after the keypress before any new track starts.
     g_out.hardFlush();
-    // Heatmap ring was just blanked. Tagging prev_us = 0 makes the
-    // next pollVisualisation (within a few ms — main loop is fast)
-    // treats this as a fresh anchor and renders once.
-    g_viz_prev_us = 0;
+    // Note: hardFlush no longer wipes the visualisation rings — the
+    // existing on-screen heatmap / waveform content is left in place to
+    // scroll off naturally as new audio arrives.
     if (g_gen && g_gen->isRunning()) g_gen->stop();
     gen_to_free = g_gen;
     src_to_free = g_src;
@@ -2257,13 +2256,9 @@ static void seekToByte(uint32_t target) {
     if (!g_audio_mutex) return;
     xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
     if (g_src) g_src->seek(target, SEEK_SET);
-    // Intra-track seek: blank the heatmap so we don't keep showing
-    // pre-seek bins scrolling left while new audio enters from the
-    // right. Pre-buffer and speaker are intentionally not flushed —
-    // existing audio plays through, the heatmap just resets its view.
-    g_out.resetVisualisation();
     xSemaphoreGive(g_audio_mutex);
-    g_viz_prev_us = 0;  // pollVisualisation will re-anchor + render
+    // Visualisation rings are intentionally NOT wiped — existing
+    // on-screen content scrolls off naturally as new audio arrives.
 }
 
 // Audio range = source size minus the leading metadata (e.g. ID3v2 tag)

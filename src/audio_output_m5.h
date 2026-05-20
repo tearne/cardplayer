@@ -200,7 +200,9 @@ public:
         _prebuf_head  = 0;
         _prebuf_tail  = 0;
         _prebuf_count = 0;
-        resetVisualisation();
+        // Visualisation rings deliberately left intact — the on-screen
+        // heatmap / waveform scrolls continuously across jumps. Call
+        // `resetVisualisation` separately if a true blank is desired.
         if (_spk) _spk->stop();
     }
 
