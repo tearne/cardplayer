@@ -26,10 +26,14 @@ static constexpr int      SPEC_BINS         = 28;
 // latest write to wrap into x=0. Doubling the ring puts 240 cols of
 // margin between writer and reader.
 static constexpr int      SPEC_COLS         = 480;
-// ~8.3 ms per column at 44.1 kHz ≈ 240 cols × 8.3 ms = 2 s on screen.
+// ~8.5 ms per column at 44.1 kHz ≈ 240 cols × 8.5 ms = 2.04 s on screen.
+// Tuned so audio col rate (~117/sec) matches the render rate (~58.8
+// renders/sec × 2 cols/render). The render period (17 ms) sits just
+// outside the panel's scan period so pushes don't queue up faster
+// than the panel can consume them, which kept waitDisplay variance low.
 // Floor is SPEC_FFT_SIZE (256) — below that, columns commit faster than
 // FFTs fire and some render as silence.
-static constexpr uint32_t SPEC_COL_SAMPLES  = 368;  // ~8.3 ms at 44.1 kHz
+static constexpr uint32_t SPEC_COL_SAMPLES  = 375;  // ~8.5 ms at 44.1 kHz
 
 struct SpectrumRing {
     uint8_t  intensity[SPEC_COLS][SPEC_BINS] = {};
