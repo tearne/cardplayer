@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.60 — 2026-05-20
+
+- RAM trims: spectrum and waveform ring buffers shrunk to 256 columns (from 480), speaker output staging cut from 3 to 2 ring slots, audio and visualisation task stacks tightened. Heap usage 86 % → 82 % (~13 KB freed). No user-visible behaviour changes.
+
+## 0.21.59 — 2026-05-20
+
+- Visualisation pipeline simplified: the per-frame heatmap / waveform composition now writes straight into the main canvas instead of into a dedicated 27 KB sprite that mirrored the same pixels. Frees ~22 KB of RAM (93 → 86 %) and eliminates a heap-fragmentation failure mode where a diagnostics-row toggle could blank the screen and pin a CPU core when free heap was low.
+
 ## 0.21.58 — 2026-05-20
 
 - Visualisation no longer blanks on track jumps or intra-track seeks. The previously-rendered heatmap / waveform content stays on screen and scrolls off naturally as new audio arrives.

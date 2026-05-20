@@ -25,7 +25,7 @@ static constexpr int      SPEC_BINS         = 28;
 // SCREEN_W there's no headroom: a 1-col lag in disp_abs caused the
 // latest write to wrap into x=0. Doubling the ring puts 240 cols of
 // margin between writer and reader.
-static constexpr int      SPEC_COLS         = 480;
+static constexpr int      SPEC_COLS         = 256;
 // Visualisation tuning.
 //
 // `VIZ_ZOOM_SECONDS` is the user-facing knob — how long a span of audio
@@ -59,7 +59,7 @@ struct SpectrumRing {
 // to slide over the buffer without falling off the ends. New cols still
 // arrive at audio rate; the viewport position is driven by wall-clock
 // time so display scroll stays smooth even when the data head jitters.
-static constexpr int WV_COLS = 480;
+static constexpr int WV_COLS = 256;
 struct WaveformRing {
     int8_t  min_v[WV_COLS] = {};
     int8_t  max_v[WV_COLS] = {};
@@ -317,7 +317,7 @@ private:
     // by the time we cycle back to a slot, playRaw will have blocked
     // until the speaker is no longer holding it.
     static constexpr size_t BUF_SIZE   = 1536;
-    static constexpr size_t RING_COUNT = 3;
+    static constexpr size_t RING_COUNT = 2;
 
     // Pre-buffer: ~150 ms at 44.1 kHz mono = 6615 samples. Sized a bit
     // larger so a full-slot copy doesn't immediately empty it.
