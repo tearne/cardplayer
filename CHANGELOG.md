@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.57 — 2026-05-20
+
+- Visualisation tear minimised. Render task now driven by `esp_timer` at the empirically-calibrated panel scan period (~16780 µs ≈ 59.6 Hz), so pushes consistently land at the same scan phase = stationary tear. With 1 column per render at 4 s on screen, the tear shift drops to 1 pixel — essentially imperceptible. `Ctrl+T` toggles a vertical-bar test pattern for per-device panel-rate calibration. Diagnostics row updates restored during visualisation via a lightweight header-rows-only push.
+
+## 0.21.40 — 2026-05-20
+
+- Scroll smoothness rework. The visualisation overlay is now rendered by a dedicated FreeRTOS task driven by an `esp_timer` at microsecond precision (~60 Hz), independent of main-loop poll variance. A persistent sprite scrolls left by N columns per render and only repaints the newly-arrived rightmost columns, dropping compose work from ~9 ms to ~2 ms per frame. Time-window, audio col rate, and render granularity are now derived from a single `VIZ_ZOOM_SECONDS` knob. Residual is a slow left-to-right tear sweep at the difference between nominal 60 Hz and the actual panel scan — to be fine-tuned in a follow-up change.
+
 ## 0.21.11 — 2026-05-19
 
 - Panel SPI clock raised 40 → 80 MHz, halving display push duration (~8.5 → ~4.5 ms measured). Modest visible improvement to heatmap tearing; main benefit is lower main-loop CPU cost during visualisation playback.

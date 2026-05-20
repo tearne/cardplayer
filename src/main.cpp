@@ -29,7 +29,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.21.33";
+static constexpr const char* APP_VERSION = "0.21.57";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -78,14 +78,34 @@ static constexpr int FOOTER_BAR_H  = 6;
 static constexpr uint32_t AUDIO_TASK_STACK    = 8 * 1024;
 static constexpr UBaseType_t AUDIO_TASK_PRIO  = 3;
 static constexpr BaseType_t AUDIO_TASK_CORE   = 0;
-// Visualisation render task — runs at a precise wall-clock interval so
-// scroll motion is decoupled from main-loop poll variance. Pinned to
-// core 1 (same as Arduino loop), priority above loop (priority 1) so
-// the render preempts main work when its tick fires.
+// Visualisation render task — fires from an `esp_timer` periodic callback
+// rather than `vTaskDelayUntil` so we get microsecond-precision scheduling.
+// Locking the render period to the panel scan period eliminates the beat
+// frequency between renders and panel refresh (which manifested as a slow
+// left-to-right tear sweep at the beat frequency).
+//
+// Render derivations:
+//   render_period_us = 1e6 / panel_scan_hz
+//   cols_per_render  = display_cols_per_sec / panel_scan_hz
+//   (must be a clean integer — static_assert below)
 static constexpr uint32_t VIZ_TASK_STACK      = 4 * 1024;
 static constexpr UBaseType_t VIZ_TASK_PRIO    = 2;
 static constexpr BaseType_t VIZ_TASK_CORE     = 1;
-static constexpr uint32_t VIZ_TASK_PERIOD_MS  = 17;  // just slower than panel scan
+// Render rate. Setting this to half the panel scan rate (= 30 Hz when
+// panel is 60 Hz) makes each rendered frame persist on the panel for two
+// scan cycles — one with tear at the push moment, one clean rescan. The
+// eye blends and perceives the clean frame as dominant. At full panel
+// rate, tear is constantly visible at the same stationary position.
+static constexpr uint32_t VIZ_RENDER_HZ       = 60;
+// Render period — calibrated empirically against the actual panel scan
+// rate (~59.54 Hz on this Cardputer).
+static constexpr uint32_t RENDER_PERIOD_US    = 16780;
+static constexpr int      VIZ_COLS_PER_PUSH   =
+    (int)(VIZ_COLS_PER_SEC / (float)VIZ_RENDER_HZ + 0.5f);
+static_assert(VIZ_COLS_PER_PUSH * (int)VIZ_RENDER_HZ ==
+              (int)(VIZ_COLS_PER_SEC + 0.5f),
+              "VIZ_COLS_PER_SEC must be an integer multiple of VIZ_RENDER_HZ "
+              "— adjust VIZ_ZOOM_SECONDS or VIZ_RENDER_HZ");
 static constexpr uint32_t DIAGNOSTICS_POLL_MS = 250;
 
 // Browser uses the full display width. The scrollbar reserves a narrow
@@ -189,6 +209,11 @@ static inline void presentFrame() {
 // lives further down with the rest of the visualisation block.
 static bool g_waveform_active = false;
 static bool g_heatmap_active  = false;
+// Diagnostic test-pattern overlay — replaces audio-derived rendering
+// with evenly-spaced scrolling bright bars so beat-frequency tear is
+// directly observable for panel-rate calibration.
+static bool g_viz_test_pattern = false;
+static constexpr int VIZ_TEST_BAR_SPACING = 30;
 
 // Push only rows [y, y + h) of the canvas to the panel. The canvas is at
 // 8 bpp (RGB332) and the panel is 16 bpp (RGB565), so we can't pushImage
@@ -327,6 +352,11 @@ static int                   g_top    = 0;
 static M5Canvas g_viz_sprite(&M5Cardputer.Display);
 static int      g_viz_sprite_h = 0;
 static bool     g_viz_sprite_dirty = true;  // force full redraw
+// Serialises every sprite operation between the main loop (which calls
+// composeVisualisationOverlay during draw()) and the vizTask (per-frame
+// render). Without it, a toggleDiagnostics-driven resize can interleave
+// with a vizTask render, corrupting the sprite buffer mid-pushSprite.
+static SemaphoreHandle_t g_viz_sprite_mutex = nullptr;
 
 // Visualisation overlay state — drives both waveform and heatmap views.
 // `g_waveform_active` and `g_heatmap_active` are independent on/off
@@ -350,10 +380,7 @@ static uint64_t g_viz_last_rendered_abs = ~(uint64_t)0;
 static uint64_t g_viz_anchor_abs = 0;
 static uint32_t g_viz_anchor_us  = 0;
 static constexpr double VIZ_PRED_LAG_REANCHOR_COLS = 20.0;
-// Render granularity: how many cols of disp_abs travel between pushes.
-// 1 = smoothest scroll, maximum push frequency. Larger values reduce
-// push frequency at the cost of perceiving the scroll as a chunky step.
-static constexpr int      VIZ_COLS_PER_PUSH = 2;
+// VIZ_COLS_PER_PUSH derived earlier from VIZ_COLS_PER_SEC / PANEL_SCAN_HZ.
 // Lookahead also serves as cap headroom: predicted can be up to
 // `lookahead_cols` ahead of actual without target_max overshooting a
 // written slot. To avoid cap-firing pulsation during decoder bursts,
@@ -652,14 +679,20 @@ static void audioTask(void*) {
 // Forward decl — defined later in the file.
 static void pollVisualisation();
 
-// Render task — wakes at precise wall-clock intervals so the visible
-// scroll cadence is independent of main-loop poll variance. The task
-// just calls pollVisualisation; the threshold logic inside still
-// applies but is now always met by the time we wake.
+// Render task — woken by an esp_timer periodic notification rather than
+// vTaskDelayUntil so the render period is precise to microseconds (not
+// 1 ms FreeRTOS ticks). This lets us lock the period exactly to the
+// panel scan period and eliminates the beat-frequency tear sweep we saw
+// at coarser scheduling.
+static TaskHandle_t g_viz_task_handle = nullptr;
+
+static void vizTimerCallback(void*) {
+    if (g_viz_task_handle) xTaskNotifyGive(g_viz_task_handle);
+}
+
 static void vizTask(void*) {
-    TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(VIZ_TASK_PERIOD_MS));
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         pollVisualisation();
     }
 }
@@ -881,7 +914,7 @@ static void drawDiagnosticsRow() {
                    g_spark_cpu0, g_spark_cpu1);
 }
 
-static void drawHeader() {
+static void drawHeaderToCanvas() {
     auto& d = g_canvas;
     d.fillRect(0, 0, SCREEN_W, headerH(), BLACK);
 
@@ -944,6 +977,10 @@ static void drawHeader() {
     // high CPU. Header's mid-grey text reads as background against the
     // saturated cyan/orange sparkline lines.
     if (!g_diagnostics_hidden) drawDiagnosticsRow();
+}
+
+static void drawHeader() {
+    drawHeaderToCanvas();
     presentFrame();
 }
 
@@ -1028,17 +1065,16 @@ static void pollDiagnostics() {
     g_diag_cpu1_pct = (int)(100.0f * load1 + 0.5f);
 
     if (overlayActive() || g_diagnostics_hidden) return;
-    // Suppress the header refresh while a visualisation overlay is up.
-    // drawHeader's push contends with the viz task's render via the
-    // display mutex, producing alternating fast/slow render intervals
-    // that read as judder. Diag readouts still update if the viz is
-    // dismissed; they're just frozen on-screen while it's running.
-    if (g_waveform_active || g_heatmap_active) return;
     // Re-render the entire header so the path/version text is fresh
-    // before the sparkline overlays it. Just redrawing the diagnostics
-    // row alone would leave stale sparkline pixels in the row-1 region
-    // where the graph extends over the path slot.
-    drawHeader();
+    // before the sparkline overlays it. During visualisation use a
+    // header-rows-only push so we don't shove a full-canvas presentFrame
+    // through the display mutex against the vizTask's per-frame push.
+    if (g_waveform_active || g_heatmap_active || g_viz_test_pattern) {
+        drawHeaderToCanvas();
+        presentRows(0, headerH());
+    } else {
+        drawHeader();
+    }
 }
 
 static int displayedBatteryLevel(int mv) {
@@ -1064,6 +1100,15 @@ static void toggleHeatmap() {
     g_viz_prev_us = 0;
     g_viz_sprite_dirty = true;
     draw();
+}
+
+static void toggleTestPattern() {
+    g_viz_test_pattern = !g_viz_test_pattern;
+    g_viz_sprite_dirty = true;
+    draw();
+    presentFrame();
+    Serial.printf("test pattern = %d, browserY=%d browserH=%d\n",
+                  g_viz_test_pattern ? 1 : 0, browserY(), browserH());
 }
 
 // Periodic redraw of the waveform view. Only pushes the browser rows, not
@@ -1170,7 +1215,7 @@ static void drawVizColIntoSprite(int sprite_h, int x, uint64_t col_abs);
 // and drives either or both overlays via `composeBrowser`. Both rings
 // commit at the same audio rate, so a single cursor is sufficient.
 static void pollVisualisation() {
-    if (!g_waveform_active && !g_heatmap_active) return;
+    if (!g_waveform_active && !g_heatmap_active && !g_viz_test_pattern) return;
     if (g_screen_state == SCREEN_OFF) return;
     uint32_t now_us = micros();
     uint64_t abs    = g_out.spectrumRing().abs_head;
@@ -1211,9 +1256,11 @@ static void pollVisualisation() {
         g_viz_prev_us    = now_us;
         g_viz_last_rendered_abs = (uint64_t)g_viz_disp_abs;
         int inner_h = browserH() - 2;
+        if (g_viz_sprite_mutex) xSemaphoreTake(g_viz_sprite_mutex, portMAX_DELAY);
         initVizSprite(inner_h);
         fullRedrawVizSprite();
         g_viz_sprite.pushSprite(&g_canvas, 0, browserY() + 1);
+        if (g_viz_sprite_mutex) xSemaphoreGive(g_viz_sprite_mutex);
         presentRows(browserY() + 1, inner_h);
         return;
     }
@@ -1247,9 +1294,9 @@ static void pollVisualisation() {
     g_viz_last_rendered_abs = disp_int;
 
     int inner_h = browserH() - 2;
-    initVizSprite(inner_h);
 
-    uint32_t t_pre = micros();
+    if (g_viz_sprite_mutex) xSemaphoreTake(g_viz_sprite_mutex, portMAX_DELAY);
+    initVizSprite(inner_h);
     if (g_viz_sprite_dirty) {
         fullRedrawVizSprite();
     } else {
@@ -1265,38 +1312,9 @@ static void pollVisualisation() {
     // more work than direct sprite→display but avoids 8 bpp→16 bpp DMA
     // race issues we saw with the direct path.
     g_viz_sprite.pushSprite(&g_canvas, 0, browserY() + 1);
-    uint32_t t_compose = micros() - t_pre;
+    if (g_viz_sprite_mutex) xSemaphoreGive(g_viz_sprite_mutex);
 
-    uint32_t t_push_start = micros();
     presentRows(browserY() + 1, inner_h);
-    uint32_t t_push = micros() - t_push_start;
-
-    static uint32_t last_render_us = 0;
-    static uint32_t min_interval = 0xFFFFFFFF;
-    static uint32_t max_interval = 0;
-    static uint32_t max_compose  = 0;
-    static uint32_t max_push     = 0;
-    static uint32_t last_dump_ms = 0;
-    uint32_t now_us2 = micros();
-    if (last_render_us != 0) {
-        uint32_t interval = now_us2 - last_render_us;
-        if (interval < min_interval) min_interval = interval;
-        if (interval > max_interval) max_interval = interval;
-    }
-    last_render_us = now_us2;
-    if (t_compose > max_compose) max_compose = t_compose;
-    if (t_push    > max_push)    max_push    = t_push;
-    uint32_t now_ms = millis();
-    if (now_ms - last_dump_ms >= 1000) {
-        Serial.printf("interval us min=%u max=%u, compose=%u, push=%u\n",
-                      (unsigned)min_interval, (unsigned)max_interval,
-                      (unsigned)max_compose, (unsigned)max_push);
-        min_interval = 0xFFFFFFFF;
-        max_interval = 0;
-        max_compose  = 0;
-        max_push     = 0;
-        last_dump_ms = now_ms;
-    }
 }
 
 // Animate the header spinner while a fuzzy-index build is running. Also
@@ -1596,7 +1614,7 @@ static void composeSearchView();
 static void composeVisualisationOverlay();
 
 static void composeBrowser() {
-    if (g_waveform_active || g_heatmap_active) {
+    if (g_waveform_active || g_heatmap_active || g_viz_test_pattern) {
         composeVisualisationOverlay();
         return;
     }
@@ -1863,6 +1881,15 @@ static void vizLayout(int sprite_h, int& wave_h, int& heat_h) {
 
 // Draw one column (both views, layout-aware) into the sprite at x.
 static void drawVizColIntoSprite(int sprite_h, int x, uint64_t col_abs) {
+    if (g_viz_test_pattern) {
+        // Bright bar every VIZ_TEST_BAR_SPACING cols of audio time;
+        // black otherwise. The bars scroll left with disp_abs just
+        // like real audio data, so any tear shows up as a break in
+        // the grid pattern.
+        bool bar = (col_abs % VIZ_TEST_BAR_SPACING) == 0;
+        g_viz_sprite.fillRect(x, 0, 1, sprite_h, bar ? (uint16_t)0xFFFF : (uint16_t)BLACK);
+        return;
+    }
     int wave_h, heat_h;
     vizLayout(sprite_h, wave_h, heat_h);
     if (wave_h > 0) drawWaveformColIntoSprite(0, wave_h, x, (int64_t)col_abs);
@@ -1893,9 +1920,11 @@ static void composeVisualisationOverlay() {
     int bh = browserH();
     int inner_h = bh - 2;
 
+    if (g_viz_sprite_mutex) xSemaphoreTake(g_viz_sprite_mutex, portMAX_DELAY);
     initVizSprite(inner_h);
     fullRedrawVizSprite();
     g_viz_sprite.pushSprite(&d, 0, by + 1);
+    if (g_viz_sprite_mutex) xSemaphoreGive(g_viz_sprite_mutex);
 
     d.drawFastHLine(0, by,          SCREEN_W, COL_BROWSE_FRAME);
     d.drawFastHLine(0, by + bh - 1, SCREEN_W, COL_BROWSE_FRAME);
@@ -3061,8 +3090,9 @@ void setup() {
 
     applyVolume();
 
-    g_audio_mutex   = xSemaphoreCreateMutex();
-    g_display_mutex = xSemaphoreCreateMutex();
+    g_audio_mutex      = xSemaphoreCreateMutex();
+    g_display_mutex    = xSemaphoreCreateMutex();
+    g_viz_sprite_mutex = xSemaphoreCreateMutex();
 
     // Boot-resume: if a saved track path still exists on the SD card,
     // start it paused via the normal playback path so the audio task
@@ -3090,7 +3120,15 @@ void setup() {
     xTaskCreatePinnedToCore(audioTask, "audio", AUDIO_TASK_STACK / sizeof(StackType_t),
                             nullptr, AUDIO_TASK_PRIO, &g_audio_task, AUDIO_TASK_CORE);
     xTaskCreatePinnedToCore(vizTask, "viz", VIZ_TASK_STACK / sizeof(StackType_t),
-                            nullptr, VIZ_TASK_PRIO, nullptr, VIZ_TASK_CORE);
+                            nullptr, VIZ_TASK_PRIO, &g_viz_task_handle, VIZ_TASK_CORE);
+    // Periodic timer at exactly the panel scan rate so renders don't
+    // beat against the scan, eliminating the slow tear sweep.
+    esp_timer_create_args_t viz_timer_args = {};
+    viz_timer_args.callback = vizTimerCallback;
+    viz_timer_args.name     = "viz_period";
+    esp_timer_handle_t viz_timer = nullptr;
+    esp_timer_create(&viz_timer_args, &viz_timer);
+    esp_timer_start_periodic(viz_timer, RENDER_PERIOD_US);
 
     // Per-core idle task handles so the diagnostics poll can read each
     // core's accumulated idle microseconds via vTaskGetInfo().
@@ -3191,7 +3229,7 @@ void loop() {
                     }
                 }
             }
-        } else if (g_waveform_active || g_heatmap_active) {
+        } else if (g_waveform_active || g_heatmap_active || g_viz_test_pattern) {
             // Visualisation overlay (waveform or heatmap): transport,
             // volume, and brightness keys pass through so the user can
             // keep controlling playback while watching. Everything else
@@ -3213,6 +3251,7 @@ void loop() {
                 for (char c : state.word) {
                     if      (c == 'W' || c == 'w') toggleWaveform();
                     else if (c == 'H' || c == 'h') toggleHeatmap();
+                    else if (c == 'T' || c == 't') toggleTestPattern();
                 }
             } else if (state.space) {
                 togglePause();
@@ -3252,8 +3291,9 @@ void loop() {
                 }
             }
             if (dismiss) {
-                g_waveform_active = false;
-                g_heatmap_active  = false;
+                g_waveform_active  = false;
+                g_heatmap_active   = false;
+                g_viz_test_pattern = false;
                 draw();
             }
         } else if (state.fn) {
@@ -3287,6 +3327,7 @@ void loop() {
             for (char c : state.word) {
                 if (c == 'W' || c == 'w') toggleWaveform();
                 if (c == 'H' || c == 'h') toggleHeatmap();
+                if (c == 'T' || c == 't') toggleTestPattern();
             }
         } else if (state.del) {
             // In search mode, backspace edits the query and exits when

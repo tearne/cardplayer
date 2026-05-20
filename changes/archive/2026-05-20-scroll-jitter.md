@@ -58,4 +58,26 @@ The visible jitter during scrolling is acceptably reduced or we've concluded the
 - 0.21.15, 0.21.16 (500 ms), 0.21.17 (cols-per-push 1), 0.21.18 (back to 2): pulsation persists at 5–10 Hz regardless. Even with cap effectively disabled (huge lookahead).
 - 0.21.19 added timing instrumentation. Compose ~9 ms, push ~6 ms, very stable. Render time fits the 16.6 ms threshold but with little slack — and the *interval* between renders is bound to the main loop's variance. So the cursor mechanism is fine; the constraint is compose cost dominating render budget.
 - 0.21.20: structural fix. Added persistent `g_viz_sprite` (8 bpp, browser-inner size). Each render: scroll left by `VIZ_COLS_PER_PUSH`, draw only the new rightmost columns. Compose work drops from 240 × 28 = 6720 fillRects to ~28-56 fillRects + an 8 bpp memmove. Sprite pushed directly to display (skipping g_canvas conversion). On mode change / size change / snap, dirty flag forces a full sprite redraw.
+- 0.21.21–0.21.25: iterated through DMA race fixes (waitDisplay before sprite modification), 16 bpp sprite attempt (failed alloc), direct vs canvas push paths. Settled on 8 bpp sprite → push to canvas → presentRows path. Compose dropped to ~2 ms, push ~6 ms. But render interval variance persisted: 19 / 90+ ms spikes.
+- 0.21.26: disabled `pollDiagnostics` — no help. 0.21.27 per-poll instrumentation showed render at 15 ms / iteration, plus occasional 30-72 ms `flush` (NVS) spikes. Render rate fell ~7 % behind audio rate, snap fired periodically.
+- 0.21.28: tuned `SPEC_COL_SAMPLES` 368 → 440 to match audio rate to display rate (~100 cols/sec). Snap stopped firing but main-loop variance still produced visible irregularity.
+- 0.21.29: moved rendering to a dedicated FreeRTOS task with `vTaskDelayUntil` at 20 ms period. **Pulsation eliminated.** Interval locked to 19500–20700 us (±1 ms variance). Residual: occasional glitches from concurrent display pushes between main loop and viz task.
+- 0.21.30: added display mutex around every `presentRows` / `presentFrame`. Glitches gone.
+- 0.21.31–0.21.33: tried to zoom in (2 s on screen) by shortening period. At 16 ms period, push contention with header redraw produced alternating 13 / 19 ms intervals. 0.21.32 suppressed `drawHeader` during viz. 0.21.33 went to 17 ms — better, but a slow ~1 Hz right-to-left tear sweep appeared (beat between render rate and panel scan).
+- 0.21.34: switched to `esp_timer` for microsecond-precision period. Locked render period to nominal 60 Hz (16667 us). Parameterised on `VIZ_ZOOM_SECONDS` so changing the time window auto-derives `SPEC_COL_SAMPLES` and `VIZ_COLS_PER_PUSH` (static_assert on integer constraint).
+- 0.21.35: added sprite mutex protecting `composeVisualisationOverlay` / `pollVisualisation` from racing on resize (diagnostics toggle changing browser height).
+- 0.21.36–0.21.39: empirical tuning of `RENDER_PERIOD_US` to find actual panel rate. Determined panel scan is between 60 and 61 Hz. Beat reduced but still visible. Further fine-tuning warrants a dedicated test pattern — broken off as a follow-up.
+- 0.21.40: reverted to 16667 us (60 Hz nominal) baseline, removed instrumentation, ready to ship.
+
+## Conclusion
+
+Pulsation is gone. The structural changes that made it possible:
+
+1. **Persistent viz sprite + scroll-and-draw**. Compose dropped from ~9 ms to ~2 ms by maintaining a sprite that scrolls left by N columns per render and only paints the newly-arrived rightmost columns. Sprite size is the browser inner area.
+2. **Dedicated render task driven by `esp_timer`.** Microsecond-precision period (16667 us nominally) eliminates main-loop variance from the render cadence. Display mutex serialises all panel pushes; sprite mutex protects sprite resize against vizTask preemption.
+3. **Parameterised on `VIZ_ZOOM_SECONDS`.** `SPEC_COL_SAMPLES` and `VIZ_COLS_PER_PUSH` derive automatically; static_assert enforces integer column-per-render constraint.
+
+Residual: a slow left-to-right tear sweep at the difference between the nominal 60 Hz render and the actual panel scan rate (somewhere between 60 and 61 Hz). The beat is barely visible at the current setting and can be tuned further via `RENDER_PERIOD_US` — that fine-tuning becomes its own change with a test pattern for methodical calibration.
+
+**Documentation impact:** none for the map. Implementation detail of the visualisation render pipeline.
 

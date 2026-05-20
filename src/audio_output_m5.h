@@ -26,14 +26,24 @@ static constexpr int      SPEC_BINS         = 28;
 // latest write to wrap into x=0. Doubling the ring puts 240 cols of
 // margin between writer and reader.
 static constexpr int      SPEC_COLS         = 480;
-// ~8.5 ms per column at 44.1 kHz ≈ 240 cols × 8.5 ms = 2.04 s on screen.
-// Tuned so audio col rate (~117/sec) matches the render rate (~58.8
-// renders/sec × 2 cols/render). The render period (17 ms) sits just
-// outside the panel's scan period so pushes don't queue up faster
-// than the panel can consume them, which kept waitDisplay variance low.
-// Floor is SPEC_FFT_SIZE (256) — below that, columns commit faster than
-// FFTs fire and some render as silence.
-static constexpr uint32_t SPEC_COL_SAMPLES  = 375;  // ~8.5 ms at 44.1 kHz
+// Visualisation tuning.
+//
+// `VIZ_ZOOM_SECONDS` is the user-facing knob — how long a span of audio
+// is visible on screen. Everything else derives from it (here and in
+// main.cpp). The relationship:
+//
+//   display_cols_per_sec = SCREEN_W / ZOOM_SECONDS
+//   SPEC_COL_SAMPLES     = sample_rate / display_cols_per_sec
+//   cols_per_render      = display_cols_per_sec / panel_scan_hz  (must be int)
+//
+// For ZOOM = 2.0 at 44.1 kHz / 60 Hz panel: 120 cols/sec, 368 samples/col,
+// 2 cols per render. Floor on SPEC_COL_SAMPLES is SPEC_FFT_SIZE (256) —
+// below that, commits outrun FFTs.
+static constexpr float    VIZ_ZOOM_SECONDS  = 4.0f;
+static constexpr int      VIZ_SCREEN_COLS   = 240;
+static constexpr float    VIZ_COLS_PER_SEC  = VIZ_SCREEN_COLS / VIZ_ZOOM_SECONDS;
+static constexpr uint32_t SPEC_COL_SAMPLES  =
+    (uint32_t)(44100.0f / VIZ_COLS_PER_SEC + 0.5f);
 
 struct SpectrumRing {
     uint8_t  intensity[SPEC_COLS][SPEC_BINS] = {};
