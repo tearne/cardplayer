@@ -127,9 +127,9 @@ Second row of the header, showing live device-resource readouts useful during de
 
 - Eight numeric readouts in a 4×2 grid plus a per-core CPU sparkline, refreshed four times a second. The sparkline takes the full row-2 height (32 px) for y-axis resolution.
 
-- **stk** — peak audio-task stack use, as a percentage of its 8 KB allocation. Watermark — never decreases.
+- **stk** — peak audio-task stack use, as a percentage of its 6 KB allocation. Watermark — never decreases.
 
-- **buf** — ring-buffer headroom: time spent waiting for the speaker to drain before submitting the next chunk, as a percentage of a 2 ms cap.
+- **buf** — minimum pre-buffer fill seen in the last sample window, as a percentage of capacity. 100 % = decoder running well ahead; near 0 % = close to underrun.
 
 - **ram** — internal-heap use as a percentage of total.
 
@@ -204,19 +204,17 @@ A thin strip at the bottom of the display carrying — left to right — the pla
 
 Everything the user does is via the Cardputer's keyboard — there is no touch or rotary input.
 
-`Fn` selects an alternate binding set; plain bindings fire only when `Fn` is not held, and Fn-modified keys with no binding are no-ops. `shift` is encoded into the printable character by the hardware (`shift+/` → `?`). `Ctrl` is used by one binding (`Ctrl+W`). `opt`, `alt`, `tab` are exposed by the library but ignored.
+`Fn` selects an alternate binding set; plain bindings fire only when `Fn` is not held, and Fn-modified keys with no binding are no-ops. `shift` is encoded into the printable character by the hardware (`shift+/` → `?`). `Ctrl` is used by the visualisation toggles. `opt`, `alt`, `tab` are exposed by the library but ignored.
 
 The bindings:
 
 - `;` / `.` — move selection up / down (also moves the result cursor in search; in [Settings](#settings), moves the row cursor)
 
-- `,` / `/` — step out to parent / enter highlighted directory (in [Settings](#settings), adjust the selected row; auto-repeats while held)
+- `,` / `/` — step out / activate the highlighted entry (descend a directory, start a track, play a search result, or adjust a [Settings](#settings) row). Auto-repeats while held.
 
 - `'` — jump to the currently-playing track
 
 - `{` / `}` — skip to previous / next track within the playing directory
-
-- `enter` — start playing the selected track / descend into a directory / activate a search result / fire a [Settings](#settings) action (no-op on the already-playing track)
 
 - `space` — pause / resume (passes through [Settings](#settings))
 
@@ -245,6 +243,8 @@ The bindings:
 - `Fn+=` / `Fn+-` — brightness up / down (shifted variants `Fn++` / `Fn+_` also accepted)
 
 - `Ctrl+W` — toggle [Waveform Visualisation](#waveform-visualisation) overlay during playback
+
+- `Ctrl+H` — toggle Heatmap Visualisation overlay during playback
 
 # Playback
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.21.66 — 2026-05-21
+
+- `enter` is no longer used anywhere. `/` is the single activate key: descend a directory, play an audio entry, activate a search result, activate a Settings action row, or confirm a reset prompt. Fixes a search-mode bug where `/` activated the directory-cursor's entry instead of the highlighted search result.
+
+## 0.21.65 — 2026-05-21
+
+- Browser activation simplified onto `/`. `/` now descends directories *and* starts audio entries from the beginning (including the currently-playing track, which previously was a no-op). `enter` is no longer used in the browser. `space` keeps its pause/resume role.
+
+## 0.21.63 — 2026-05-21
+
+- Audio path fixes. Speaker output staging restored to 3 ring slots (the trim to 2 had caused crackling). The `buf%` diagnostic readout now reflects the minimum pre-buffer fill seen across each 250 ms sample window — a real worst-case headroom indicator — instead of the previous one-shot playRaw-blocking-time snapshot which swung between 100 % and 1 % on a healthy pipeline.
+
 ## 0.21.60 — 2026-05-20
 
 - RAM trims: spectrum and waveform ring buffers shrunk to 256 columns (from 480), speaker output staging cut from 3 to 2 ring slots, audio and visualisation task stacks tightened. Heap usage 86 % → 82 % (~13 KB freed). No user-visible behaviour changes.

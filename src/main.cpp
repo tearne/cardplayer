@@ -29,7 +29,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.21.60";
+static constexpr const char* APP_VERSION = "0.21.66";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -451,7 +451,6 @@ static TaskHandle_t      g_audio_task  = nullptr;
 static uint32_t g_diag_last_ms   = 0;
 static uint32_t g_diag_stack_used = 0;
 static uint32_t g_diag_underruns  = 0;
-static uint32_t g_diag_wait_us    = 0;
 
 // One sample per pixel of graph width; new samples land on the right and
 // the buffer slides left once full. Stored as 0..255 so each bar's height
@@ -1013,17 +1012,17 @@ static void pollDiagnostics() {
             ? (AUDIO_TASK_STACK - free_bytes) : 0;
     }
     g_diag_underruns = g_out.underruns();
-    g_diag_wait_us   = g_out.lastWaitMicros();
 
     g_diag_stk_pct = (int)(100.0f * (float)g_diag_stack_used
                            / (float)AUDIO_TASK_STACK + 0.5f);
 
-    // Buffer headroom: time the audio task spent waiting for the speaker to
-    // drain before submitting the next chunk. More wait = more headroom.
-    // Capped at 2 ms (the original full-bar mark).
-    float buf_frac = g_diag_wait_us > 2000 ? 1.0f
-                                            : (float)g_diag_wait_us / 2000.0f;
-    g_diag_buf_pct = (int)(100.0f * buf_frac + 0.5f);
+    // Buffer headroom: minimum pre-buffer fill since the last sample,
+    // as a percentage of the pre-buffer capacity. Better than the
+    // previous "playRaw blocking time" snapshot — captures the
+    // worst-case headroom in the window rather than a single moment.
+    size_t prebuf_min = g_out.prebufMinAndReset();
+    g_diag_buf_pct = (int)(100.0f * (float)prebuf_min
+                           / (float)g_out.prebufCapacity() + 0.5f);
 
     uint32_t heap_total = ESP.getHeapSize();
     uint32_t heap_free  = ESP.getFreeHeap();
@@ -2070,21 +2069,10 @@ static void activateSelection() {
         draw();
     } else if (e.kind == KIND_AUDIO) {
         std::string full = joinPath(g_cur_path, e.name);
-        // Idempotent: pressing Enter on the already-playing track is a
-        // no-op rather than stopping it. Avoids surprise stop / restart
-        // when the cursor lands on the playing track.
-        if (g_play_path == full && g_audio_active) return;
+        // `/` on any audio entry — including the currently-playing one —
+        // starts it from the beginning. Pause/resume stays on `space`.
         startPlayback(full);
         drawFooter();
-    }
-}
-
-static void descend() {
-    if (g_entries.empty()) return;
-    const Entry& e = g_entries[g_cursor];
-    if (e.kind == KIND_DIR) {
-        loadDir(joinPath(g_cur_path, e.name));
-        draw();
     }
 }
 
@@ -2869,6 +2857,12 @@ static void adjustSettingsRow(int delta) {
         activateSettingsRow();  // reuses the toggle path and redraws
         return;
     }
+    if (r.kind == SRK_ACTION) {
+        // `/` activates action rows; `,` is a no-op (actions have no
+        // sense of "off").
+        if (delta > 0) activateSettingsRow();
+        return;
+    }
     if (r.kind != SRK_NUMERIC) return;
     switch (id) {
         case SR_FONT: changeFontNotch(delta); break;
@@ -3136,9 +3130,11 @@ void loop() {
         }
 
         if (g_show_reset_modal) {
-            // Enter confirms the destructive action; any other key — letter,
+            // `/` confirms the destructive action; any other key — letter,
             // del, space, anything — cancels and dismisses.
-            if (state.enter) {
+            bool confirm = false;
+            for (char c : state.word) if (c == '/') confirm = true;
+            if (confirm) {
                 confirmReset();
             } else if (!state.word.empty() || state.del || state.space) {
                 dismissResetModal();
@@ -3155,24 +3151,22 @@ void loop() {
                 if (c == ';') { scrollHelp(-1); handled = true; }
                 else if (c == '.') { scrollHelp(+1); handled = true; }
             }
-            if (!handled && (!state.word.empty() || state.enter)) {
+            if (!handled && !state.word.empty()) {
                 g_show_help = false;
                 if (g_show_settings) drawSettings();
                 else                 draw();
             }
         } else if (g_show_settings) {
-            // Settings screen: ; / . move cursor, , / / adjust numeric rows,
-            // enter activates, Fn+` or ? dismisses. Volume (- / =) and pause
-            // (space) also pass through so the user can keep adjusting
-            // playback while a settings screen is up.
+            // Settings screen: ; / . move cursor, , / / adjust the row
+            // (toggle off/on, numeric -/+ , or activate an action row),
+            // Fn+` or ? dismisses. Volume (- / =) and pause (space) also
+            // pass through so the user can keep adjusting playback.
             if (state.fn) {
                 for (char c : state.word) {
                     if      (c == '`') { dismissSettings(); break; }
                     else if (c == '=' || c == '+') changeBrightness(+1);
                     else if (c == '-' || c == '_') changeBrightness(-1);
                 }
-            } else if (state.enter) {
-                activateSettingsRow();
             } else if (state.space) {
                 togglePause();
             } else {
@@ -3219,7 +3213,7 @@ void loop() {
                 }
             } else if (state.space) {
                 togglePause();
-            } else if (state.enter || state.del || state.tab) {
+            } else if (state.del || state.tab) {
                 dismiss = true;
             } else {
                 for (char c : state.word) {
@@ -3312,7 +3306,10 @@ void loop() {
                 }
                 switch (c) {
                     case ',': ascend();   break;
-                    case '/': descend();  break;
+                    case '/':
+                        if (g_search_active) searchActivate();
+                        else                 activateSelection();
+                        break;
                     case ' ': togglePause(); break;
                     case '=': changeVolume(+1); break;
                     case '-': changeVolume(-1); break;
@@ -3342,10 +3339,10 @@ void loop() {
                         break;
                 }
             }
-            if (state.enter) {
-                if (g_search_active) searchActivate();
-                else                 activateSelection();
-            }
+            // `enter` is unused throughout — `/` is the universal
+            // activate key (descends dirs, starts audio, activates
+            // search results, confirms reset modal, activates Settings
+            // action rows).
         }
     }
 

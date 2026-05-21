@@ -228,6 +228,15 @@ public:
     uint32_t underruns()      const { return _underruns; }
     uint32_t lastWaitMicros() const { return _last_wait_us; }
     size_t   prebufSamples()  const { return _prebuf_count; }
+    size_t   prebufCapacity() const { return PREBUF_SAMPLES; }
+    // Min pre-buffer fill since the last call, then resets. Better
+    // headroom indicator than `lastWaitMicros` — captures the worst
+    // moment in the window, not a single snapshot.
+    size_t   prebufMinAndReset() {
+        size_t m = _prebuf_min_count;
+        _prebuf_min_count = _prebuf_count;
+        return m;
+    }
 
     void resetFormatLog() { _log_pending = true; _samples_consumed = 0; }
     uint32_t samplesConsumed() const { return _samples_consumed; }
@@ -298,6 +307,8 @@ private:
             _prebuf_tail = (_prebuf_tail + 1) % PREBUF_SAMPLES;
         }
         _prebuf_count -= n;
+        // Track worst-case fill since last diag sample.
+        if (_prebuf_count < _prebuf_min_count) _prebuf_min_count = _prebuf_count;
 
         bool was_drained = _submitted_once && !_spk->isPlaying();
         if (was_drained) ++_underruns;
@@ -317,10 +328,11 @@ private:
     // by the time we cycle back to a slot, playRaw will have blocked
     // until the speaker is no longer holding it.
     static constexpr size_t BUF_SIZE   = 1536;
-    static constexpr size_t RING_COUNT = 2;
+    static constexpr size_t RING_COUNT = 3;
 
-    // Pre-buffer: ~150 ms at 44.1 kHz mono = 6615 samples. Sized a bit
-    // larger so a full-slot copy doesn't immediately empty it.
+    // Pre-buffer: ~158 ms at 44.1 kHz mono = 7000 samples. Sized a bit
+    // larger than the minimum-safe (~150 ms) so a full-slot ship doesn't
+    // immediately empty it.
     static constexpr size_t PREBUF_SAMPLES = 7000;  // ~158 ms at 44.1 kHz
 
     m5::Speaker_Class* _spk = nullptr;
@@ -330,6 +342,7 @@ private:
     size_t   _prebuf_head  = 0;   // next write
     size_t   _prebuf_tail  = 0;   // next read
     size_t   _prebuf_count = 0;
+    size_t   _prebuf_min_count = PREBUF_SAMPLES;  // tracks worst-case fill
     uint32_t _underruns = 0;
     uint32_t _last_wait_us = 0;
     bool     _submitted_once = false;
