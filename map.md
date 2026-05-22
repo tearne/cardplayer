@@ -18,7 +18,9 @@ Application
 │ │ └ Diagnostics
 │ ├ Browser
 │ │ ├ Fuzzy Search
-│ │ └ Waveform Visualisation
+│ │ └ Visualisation
+│ │   ├ Waveform
+│ │   └ Spectrum
 │ ├ Footer
 │ ├ Settings (unreviewed)
 │ │ └ Key Reference (unreviewed)
@@ -145,12 +147,12 @@ Second row of the header, showing live device-resource readouts useful during de
 
 [Up](#screen-layout)
 [Down](#fuzzy-search)
-[Down](#waveform-visualisation)
+[Down](#visualisation)
 
 > [!WARNING]
 > Unreviewed.
 
-The main area between the header and footer. Hosts three views: a directory listing (default), a [Fuzzy Search](#fuzzy-search) entered by typing a letter, and an experimental [Waveform Visualisation](#waveform-visualisation) toggled by `Ctrl+W` during playback.
+The main area between the header and footer. Hosts three views: a directory listing (default), a [Fuzzy Search](#fuzzy-search) entered by typing a letter, and a [Visualisation](#visualisation) overlay (waveform and/or spectrum) toggled by `Ctrl+W` / `Ctrl+S` during playback.
 
 The directory listing is a single full-width column of the current directory's entries — directories first (bright cyan), then audio files (light grey), alphabetical within each group. Non-audio files are hidden by default and only appear when the "Hide non-audio" [Settings](#settings) toggle is off; they then render in dim grey at the tail of the list. Long names wrap or clip per `\` toggle. Selected row gets a subtle dark blue-grey tint. A narrow scrollbar gutter on the right indicates position when the list overflows. Slate-blue frames mark this view. Remains visible during playback.
 
@@ -177,14 +179,47 @@ Type-to-search alternative to the directory listing. Pressing any letter opens t
 
 - [Controls](#controls) — `a`–`z` opens, `~` rebuilds, `Fn+\`` exits
 
-# Waveform Visualisation
+# Visualisation
 
 [Up](#browser)
+[Down](#waveform)
+[Down](#spectrum)
 
-> [!WARNING]
-> Unreviewed.
+Two scrolling overlays drawn over the [Browser](#browser) during playback: a [Waveform](#waveform) (time-domain peaks) on top and a [Spectrum](#spectrum) (frequency-domain spectrogram) below. They can be on independently or together. Each has its own Ctrl shortcut; dismissing always remembers what was on screen, so a later `Tab` flicks the same combination back without re-selecting.
 
-Scrolling peak waveform overlay during playback. `Ctrl+W` toggles live; any other key dismisses. The [Settings](#settings) "Auto waveform" toggle (off by default) opens the overlay automatically at each new track's start.
+**Detail**
+
+- Dual-mode height fractions: waveform 2/5 on top, spectrum 3/5 below. Single-view mode gives the whole inner area to whichever is on.
+- Every dismiss path — `Tab`, `Fn+\`` (esc), `del`, or any other key — snapshots the current `(waveform_on, spectrum_on)` pair before clearing. `Tab` outside the overlay restores from the snapshot; cold start with no snapshot shows both views.
+- The [Settings](#settings) "Auto waveform" and "Auto spectrum" toggles independently open their view at each new track's start.
+- While an overlay is up, transport, volume, brightness, pause and the diagnostics-row toggle pass through; everything else dismisses.
+
+**See also**
+
+- [Controls](#controls) — `Ctrl+W`, `Ctrl+S`, `Tab`, `Fn+\`` bindings
+
+# Waveform
+
+[Up](#visualisation)
+
+Scrolling time-domain peak overlay — each column is the max absolute sample seen since the previous column boundary, so transients and silence read at a glance.
+
+**Detail**
+
+- Column ring sized for ~4 s of on-screen history; advanced by the audio task on column boundaries.
+- Single-view: occupies the full inner area. Dual-view: top 2/5.
+
+# Spectrum
+
+[Up](#visualisation)
+
+Scrolling FFT spectrogram — each new column encodes the magnitude of frequency bins for the current audio slice, with brighter pixels marking louder bins. Low frequencies at the bottom, high at the top.
+
+**Detail**
+
+- Computed on column boundaries from the same audio slices the waveform uses; bin intensities map to a heat-style colour ramp.
+- Column ring matches the waveform's ~4 s on-screen history so the two views scroll in lockstep.
+- Single-view: occupies the full inner area. Dual-view: bottom 3/5.
 
 # Footer
 
@@ -204,7 +239,7 @@ A thin strip at the bottom of the display carrying — left to right — the pla
 
 Everything the user does is via the Cardputer's keyboard — there is no touch or rotary input.
 
-`Fn` selects an alternate binding set; plain bindings fire only when `Fn` is not held, and Fn-modified keys with no binding are no-ops. `shift` is encoded into the printable character by the hardware (`shift+/` → `?`). `Ctrl` is used by the visualisation toggles. `opt`, `alt`, `tab` are exposed by the library but ignored.
+`Fn` selects an alternate binding set; plain bindings fire only when `Fn` is not held, and Fn-modified keys with no binding are no-ops. `shift` is encoded into the printable character by the hardware (`shift+/` → `?`). `Ctrl` is used by the visualisation toggles. `opt`, `alt` are exposed by the library but ignored.
 
 The bindings:
 
@@ -238,13 +273,15 @@ The bindings:
 
 - `~` — rebuild the fuzzy-search index in the background
 
-- `Fn+\`` (labelled "esc") — exit search; dismiss waveform overlay; dismiss [Settings](#settings)
+- `Fn+\`` (labelled "esc") — exit search; dismiss [Visualisation](#visualisation) overlay; dismiss [Settings](#settings)
 
 - `Fn+=` / `Fn+-` — brightness up / down (shifted variants `Fn++` / `Fn+_` also accepted)
 
-- `Ctrl+W` — toggle [Waveform Visualisation](#waveform-visualisation) overlay during playback
+- `Ctrl+W` — toggle [Waveform](#waveform) overlay during playback
 
-- `Ctrl+H` — toggle Heatmap Visualisation overlay during playback
+- `Ctrl+S` — toggle [Spectrum](#spectrum) overlay during playback
+
+- `Tab` — toggle the [Visualisation](#visualisation) overlay during playback; restores the last-shown combination of waveform + spectrum
 
 # Playback
 
@@ -259,7 +296,7 @@ Decoding of the current track runs on its own FreeRTOS task, separate from the m
 
 - Audio runs on core 0; the main loop runs on core 1. The audio task is explicitly pinned via `xTaskCreatePinnedToCore`. The task watchdog watches core 0's idle task — meaningful protection against a hung decoder.
 
-- Pre-buffer (~150 ms of mono samples) sits between the decoder and the speaker, decoupling decoder-fill from speaker-submit. The decoder runs ahead of audible playback by ~220 ms total (pre-buffer + 3-slot output ring + 2-deep speaker queue), giving the [Waveform Visualisation](#waveform-visualisation) meaningful future-audio look-ahead.
+- Pre-buffer (~150 ms of mono samples) sits between the decoder and the speaker, decoupling decoder-fill from speaker-submit. The decoder runs ahead of audible playback by ~220 ms total (pre-buffer + 3-slot output ring + 2-deep speaker queue), giving the [Visualisation](#visualisation) meaningful future-audio look-ahead.
 
 - User-initiated stop / skip calls `hardFlush` to discard the pre-buffer and the speaker queue — response is instant. Natural track end drains normally so the tail isn't cut, at the cost of a ~150 ms longer inter-track gap.
 
@@ -289,7 +326,7 @@ The supported formats: FLAC, MP3, AAC, M4A, WAV.
 > [!WARNING]
 > Unreviewed.
 
-User-facing state survives power cycles so volume, volume cap, brightness, current folder + cursor, font size, wrap / diagnostics / hide-non-audio / auto-play-next / auto-waveform toggles, idle timeout, and the playing track come back the way they were. On boot the saved track loads paused — playback only starts on space. Intra-track position is not persisted.
+User-facing state survives power cycles so volume, volume cap, brightness, current folder + cursor, font size, wrap / diagnostics / hide-non-audio / auto-play-next / auto-waveform / auto-spectrum toggles, idle timeout, and the playing track come back the way they were. On boot the saved track loads paused — playback only starts on space. Intra-track position is not persisted.
 
 Emergency shutdown does not save — persistence runs during normal operation, never as a shutdown step. Whatever was dirty at cutoff is lost.
 
@@ -331,7 +368,8 @@ Row list (in order):
 - *Wrap names* (toggle) — also `\`
 - *Hide non-audio* (toggle, default on) — filters the [Browser](#browser) directory listing
 - *Auto-play next* (toggle, default on) — gates the natural-track-end advance in [Playback](#playback)
-- *Auto waveform* (toggle) — auto-opens [Waveform Visualisation](#waveform-visualisation) at track start
+- *Auto waveform* (toggle) — auto-opens [Waveform](#waveform) at track start
+- *Auto spectrum* (toggle) — auto-opens [Spectrum](#spectrum) at track start
 - *Font size* (numeric)
 - *Volume max* (numeric, 4..64) — caps the live volume; the [Footer](#footer) volume bar rescales to it
 - *Brightness* (numeric, 8 log-ish steps over 6..255) — applies live via 200 ms ramp

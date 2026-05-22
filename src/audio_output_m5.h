@@ -17,7 +17,7 @@
 // Spectrum tap — 256-pt real FFT once per 256 incoming mono samples.
 // Magnitudes log-grouped into SPEC_BINS visible bands and accumulated into
 // the in-progress display column. Column commits at SPEC_COL_SAMPLES
-// boundaries, advancing a column ring read by the heatmap render path.
+// boundaries, advancing a column ring read by the spectrum render path.
 static constexpr int      SPEC_FFT_SIZE     = 256;
 static constexpr int      SPEC_BINS         = 28;
 // Ring is wider than the screen (240 px) so the audio task's writer and
@@ -201,7 +201,7 @@ public:
         _prebuf_tail  = 0;
         _prebuf_count = 0;
         // Visualisation rings deliberately left intact — the on-screen
-        // heatmap / waveform scrolls continuously across jumps. Call
+        // spectrum / waveform scrolls continuously across jumps. Call
         // `resetVisualisation` separately if a true blank is desired.
         if (_spk) _spk->stop();
     }

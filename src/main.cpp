@@ -29,7 +29,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.21.66";
+static constexpr const char* APP_VERSION = "0.21.68";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -208,7 +208,7 @@ static inline void presentFrame() {
 // Visualisation-overlay active flags. Full state (shared cursor etc.)
 // lives further down with the rest of the visualisation block.
 static bool g_waveform_active = false;
-static bool g_heatmap_active  = false;
+static bool g_spectrum_active  = false;
 // Diagnostic test-pattern overlay — replaces audio-derived rendering
 // with evenly-spaced scrolling bright bars so beat-frequency tear is
 // directly observable for panel-rate calibration.
@@ -241,7 +241,7 @@ static int  g_settings_cursor = 0;
 static bool g_hide_non_audio = true;
 static bool g_auto_play_next = true;
 static bool g_auto_waveform  = false;
-static bool g_auto_heatmap   = false;
+static bool g_auto_spectrum   = false;
 static int  g_volume_max     = 16;   // 0..MAX_VOL ceiling on live volume
 
 
@@ -350,8 +350,8 @@ static int                   g_top    = 0;
 // by the various toggle / snap paths; cleared after a full redraw.
 static bool     g_viz_sprite_dirty = true;
 
-// Visualisation overlay state — drives both waveform and heatmap views.
-// `g_waveform_active` and `g_heatmap_active` are independent on/off
+// Visualisation overlay state — drives both waveform and spectrum views.
+// `g_waveform_active` and `g_spectrum_active` are independent on/off
 // flags; both on yields the dual layout, either alone gives a single
 // full-height overlay. A single shared wall-clock-paced cursor
 // (`g_viz_disp_abs`) advances by elapsed-time / col-period each poll,
@@ -359,7 +359,7 @@ static bool     g_viz_sprite_dirty = true;
 // how fast or slow renders fire. Bursty FFT writes don't translate into
 // bursty display motion; render rate caps translate into 1-or-2-pixel
 // steps instead of accumulating lag that would eventually wrap the ring.
-// g_waveform_active / g_heatmap_active are declared earlier (above
+// g_waveform_active / g_spectrum_active are declared earlier (above
 // presentRows) so the push-duration instrumentation can see them.
 static double   g_viz_disp_abs    = 0.0;
 static uint32_t g_viz_prev_us     = 0;  // 0 = re-anchor on next poll
@@ -373,15 +373,15 @@ static uint64_t g_viz_anchor_abs = 0;
 static uint32_t g_viz_anchor_us  = 0;
 static constexpr double VIZ_PRED_LAG_REANCHOR_COLS = 20.0;
 // VIZ_COLS_PER_PUSH derived earlier from VIZ_COLS_PER_SEC / PANEL_SCAN_HZ.
-// Lookahead also serves as cap headroom: predicted can be up to
-// `lookahead_cols` ahead of actual without target_max overshooting a
-// written slot. To avoid cap-firing pulsation during decoder bursts,
-// lookahead must exceed the max burst size in cols. FLAC frame is
-// ~11 cols at the current col_period — 250 ms (~30 cols) leaves plenty
-// of headroom and lands display close to audible (tap → speaker gap
-// is ~220 ms).
-static constexpr uint32_t VIZ_LOOKAHEAD_MS = 500;
-// Dual-mode height fractions: waveform 2/5 on top, heatmap 3/5 below.
+// Lookahead serves as cap headroom: predicted can be up to `lookahead_cols`
+// ahead of actual without target_max overshooting a written slot, so it
+// must exceed the max decoder-burst size in cols (FLAC frame ~11 cols ≈
+// 90 ms). It also positions the displayed column relative to audible:
+// display ≈ abs_head − lookahead, and audible runs ~220 ms behind abs_head,
+// so a 175 ms lookahead puts the viz ~45 ms ahead of audible — set by
+// visual bisect on representative tracks.
+static constexpr uint32_t VIZ_LOOKAHEAD_MS = 175;
+// Dual-mode height fractions: waveform 2/5 on top, spectrum 3/5 below.
 static constexpr int      DUAL_WAVEFORM_NUM = 2;
 static constexpr int      DUAL_DENOM        = 5;
 
@@ -590,7 +590,7 @@ static std::string crumbForWidth(const std::string& path, int max_chars) {
     return std::string("...") + path.substr(path.size() - keep);
 }
 
-// Forward decl so stopPlayback can force an immediate heatmap redraw
+// Forward decl so stopPlayback can force an immediate spectrum redraw
 // after hardFlush; the full definition lives further down.
 static void composeBrowser();
 
@@ -610,7 +610,7 @@ static void stopPlayback() {
     // path would play out after the keypress before any new track starts.
     g_out.hardFlush();
     // Note: hardFlush no longer wipes the visualisation rings — the
-    // existing on-screen heatmap / waveform content is left in place to
+    // existing on-screen spectrum / waveform content is left in place to
     // scroll off naturally as new audio arrives.
     if (g_gen && g_gen->isRunning()) g_gen->stop();
     gen_to_free = g_gen;
@@ -728,7 +728,14 @@ static void loadState() {
     g_hide_non_audio     = g_prefs.getBool  ("hidena", g_hide_non_audio);
     g_auto_play_next     = g_prefs.getBool  ("autonx", g_auto_play_next);
     g_auto_waveform      = g_prefs.getBool  ("autowv", g_auto_waveform);
-    g_auto_heatmap       = g_prefs.getBool  ("autohm", g_auto_heatmap);
+    // One-shot rename "autohm" → "autosp": prefer the new key; fall back
+    // to the legacy key if a pre-rename install hasn't flushed yet. The
+    // legacy key is removed in flushStateIfDirty once the new one is written.
+    if (g_prefs.isKey("autosp")) {
+        g_auto_spectrum  = g_prefs.getBool("autosp", g_auto_spectrum);
+    } else {
+        g_auto_spectrum  = g_prefs.getBool("autohm", g_auto_spectrum);
+    }
     g_volume_max         = g_prefs.getInt   ("volmax", g_volume_max);
     g_idle_timeout_idx   = g_prefs.getInt   ("idleto", g_idle_timeout_idx);
     g_brightness_idx     = g_prefs.getInt   ("bright", g_brightness_idx);
@@ -757,7 +764,8 @@ static void flushStateIfDirty() {
     g_prefs.putBool  ("hidena", g_hide_non_audio);
     g_prefs.putBool  ("autonx", g_auto_play_next);
     g_prefs.putBool  ("autowv", g_auto_waveform);
-    g_prefs.putBool  ("autohm", g_auto_heatmap);
+    g_prefs.putBool  ("autosp", g_auto_spectrum);
+    g_prefs.remove("autohm");
     g_prefs.putInt   ("volmax", g_volume_max);
     g_prefs.putInt   ("idleto", g_idle_timeout_idx);
     g_prefs.putInt   ("bright", g_brightness_idx);
@@ -793,7 +801,7 @@ static void resetState() {
     g_hide_non_audio     = true;
     g_auto_play_next     = true;
     g_auto_waveform      = false;
-    g_auto_heatmap       = false;
+    g_auto_spectrum       = false;
     g_volume_max         = 16;
     g_idle_timeout_idx   = 2;
     g_brightness_idx     = BRIGHTNESS_COUNT - 1;
@@ -1059,7 +1067,7 @@ static void pollDiagnostics() {
     // before the sparkline overlays it. During visualisation use a
     // header-rows-only push so we don't shove a full-canvas presentFrame
     // through the display mutex against the vizTask's per-frame push.
-    if (g_waveform_active || g_heatmap_active || g_viz_test_pattern) {
+    if (g_waveform_active || g_spectrum_active || g_viz_test_pattern) {
         drawHeaderToCanvas();
         presentRows(0, headerH());
     } else {
@@ -1085,8 +1093,32 @@ static void toggleWaveform() {
     draw();
 }
 
-static void toggleHeatmap() {
-    g_heatmap_active = !g_heatmap_active;
+static void toggleSpectrum() {
+    g_spectrum_active = !g_spectrum_active;
+    g_viz_prev_us = 0;
+    g_viz_sprite_dirty = true;
+    draw();
+}
+
+// Last-shown viz combination, restored by `Tab` when no overlay is
+// visible. Captured by every dismiss path so the restore matches what was
+// on screen at the moment it was cleared. Defaults to both views on so
+// the very first Tab press reveals the full viz layout.
+static bool g_last_viz_waveform = true;
+static bool g_last_viz_spectrum = true;
+
+static void snapshotAndDismissViz() {
+    g_last_viz_waveform = g_waveform_active;
+    g_last_viz_spectrum = g_spectrum_active;
+    g_waveform_active  = false;
+    g_spectrum_active  = false;
+    g_viz_test_pattern = false;
+    draw();
+}
+
+static void restoreVizFromSnapshot() {
+    g_waveform_active = g_last_viz_waveform;
+    g_spectrum_active = g_last_viz_spectrum;
     g_viz_prev_us = 0;
     g_viz_sprite_dirty = true;
     draw();
@@ -1204,7 +1236,7 @@ static void drawVizColIntoCanvas(int y_top, int inner_h, int x, uint64_t col_abs
 // and drives either or both overlays via `composeBrowser`. Both rings
 // commit at the same audio rate, so a single cursor is sufficient.
 static void pollVisualisation() {
-    if (!g_waveform_active && !g_heatmap_active && !g_viz_test_pattern) return;
+    if (!g_waveform_active && !g_spectrum_active && !g_viz_test_pattern) return;
     if (g_screen_state == SCREEN_OFF) return;
     uint32_t now_us = micros();
     uint64_t abs    = g_out.spectrumRing().abs_head;
@@ -1604,7 +1636,7 @@ static void composeSearchView();
 static void composeVisualisationOverlay();
 
 static void composeBrowser() {
-    if (g_waveform_active || g_heatmap_active || g_viz_test_pattern) {
+    if (g_waveform_active || g_spectrum_active || g_viz_test_pattern) {
         composeVisualisationOverlay();
         return;
     }
@@ -1787,7 +1819,7 @@ static void composeSearchView() {
 
 // Viridis-style colour ramp: 5 hand-picked anchor stops, linearly
 // interpolated. Input 0..255 maps to a 16-bit RGB565 colour. Used by the
-// heatmap to encode bin intensity. Computed per-pixel (~7 k calls/frame
+// spectrum to encode bin intensity. Computed per-pixel (~7 k calls/frame
 // at this size, well within budget).
 static uint16_t viridis565(uint8_t v) {
     static const uint8_t stops[5][3] = {
@@ -1808,9 +1840,9 @@ static uint16_t viridis565(uint8_t v) {
     return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (bl >> 3));
 }
 
-// Draws one heatmap column directly into g_canvas at canvas-absolute
+// Draws one spectrum column directly into g_canvas at canvas-absolute
 // position (x, y_top..y_top+h-1).
-static void drawHeatmapColIntoCanvas(int y_top, int h, int x, uint64_t col_abs) {
+static void drawSpectrumColIntoCanvas(int y_top, int h, int x, uint64_t col_abs) {
     if (h <= 0) return;
     const SpectrumRing& ring = g_out.spectrumRing();
     int idx = (int)(col_abs % SPEC_COLS);
@@ -1842,17 +1874,17 @@ static void drawWaveformColIntoCanvas(int y_top, int h, int x, int64_t col_abs) 
 }
 
 // Helper for the current dual / single layout: splits the inner area
-// into waveform + heatmap heights. One side is 0 in single-view mode.
-static void vizLayout(int inner_h, int& wave_h, int& heat_h) {
-    if (g_waveform_active && g_heatmap_active) {
+// into waveform + spectrum heights. One side is 0 in single-view mode.
+static void vizLayout(int inner_h, int& wave_h, int& spec_h) {
+    if (g_waveform_active && g_spectrum_active) {
         wave_h = (inner_h * DUAL_WAVEFORM_NUM) / DUAL_DENOM;
-        heat_h = inner_h - wave_h;
+        spec_h = inner_h - wave_h;
     } else if (g_waveform_active) {
         wave_h = inner_h;
-        heat_h = 0;
+        spec_h = 0;
     } else {
         wave_h = 0;
-        heat_h = inner_h;
+        spec_h = inner_h;
     }
 }
 
@@ -1864,10 +1896,10 @@ static void drawVizColIntoCanvas(int y_top, int inner_h, int x, uint64_t col_abs
         g_canvas.fillRect(x, y_top, 1, inner_h, bar ? (uint16_t)0xFFFF : (uint16_t)BLACK);
         return;
     }
-    int wave_h, heat_h;
-    vizLayout(inner_h, wave_h, heat_h);
+    int wave_h, spec_h;
+    vizLayout(inner_h, wave_h, spec_h);
     if (wave_h > 0) drawWaveformColIntoCanvas(y_top, wave_h, x, (int64_t)col_abs);
-    if (heat_h > 0) drawHeatmapColIntoCanvas(y_top + wave_h, heat_h, x, col_abs);
+    if (spec_h > 0) drawSpectrumColIntoCanvas(y_top + wave_h, spec_h, x, col_abs);
 }
 
 // Full redraw of all 240 columns from current disp_abs into the canvas
@@ -2052,7 +2084,7 @@ static bool startPlayback(const std::string& full_path, bool start_paused = fals
     if (!start_paused) {
         bool changed = false;
         if (g_auto_waveform && !g_waveform_active) { g_waveform_active = true; changed = true; }
-        if (g_auto_heatmap  && !g_heatmap_active)  { g_heatmap_active  = true; changed = true; }
+        if (g_auto_spectrum  && !g_spectrum_active)  { g_spectrum_active  = true; changed = true; }
         if (changed) {
             g_viz_prev_us = 0;
             draw();
@@ -2101,7 +2133,7 @@ static void enterSearch(char seed) {
     // Search takes over the browser slot, so dismiss any visualisation
     // overlay first — otherwise search would be live but invisible.
     g_waveform_active = false;
-    g_heatmap_active  = false;
+    g_spectrum_active  = false;
     g_search_active   = true;
     g_search_query    = String(seed);
     // Lazy-load the index — ~30 ms SD read pays for itself in ~42 KB of
@@ -2632,7 +2664,7 @@ static void showResetModal();  // defined below
 // `,` / `/` adjust numeric rows while selected. `Fn+\`` or `?` dismisses.
 
 enum SettingsRowId {
-    SR_DIAG = 0, SR_WRAP, SR_HIDE_NA, SR_AUTO_NEXT, SR_AUTO_WAVE, SR_AUTO_HEAT,
+    SR_DIAG = 0, SR_WRAP, SR_HIDE_NA, SR_AUTO_NEXT, SR_AUTO_WAVE, SR_AUTO_SPEC,
     SR_FONT, SR_VOLMAX, SR_BRIGHT, SR_IDLE,
     SR_KEY_REF, SR_REBUILD, SR_RESET,
     SR_COUNT
@@ -2650,7 +2682,7 @@ static const SettingsRow SETTINGS_ROWS[SR_COUNT] = {
     {SRK_TOGGLE,  "Hide non-audio"},
     {SRK_TOGGLE,  "Auto-play next"},
     {SRK_TOGGLE,  "Auto waveform"},
-    {SRK_TOGGLE,  "Auto heatmap"},
+    {SRK_TOGGLE,  "Auto spectrum"},
     {SRK_NUMERIC, "Font size"},
     {SRK_NUMERIC, "Volume max"},
     {SRK_NUMERIC, "Brightness"},
@@ -2667,7 +2699,7 @@ static bool settingsRowBool(SettingsRowId id) {
         case SR_HIDE_NA:   return g_hide_non_audio;
         case SR_AUTO_NEXT: return g_auto_play_next;
         case SR_AUTO_WAVE: return g_auto_waveform;
-        case SR_AUTO_HEAT: return g_auto_heatmap;
+        case SR_AUTO_SPEC: return g_auto_spectrum;
         default:           return false;
     }
 }
@@ -2816,8 +2848,8 @@ static void activateSettingsRow() {
                 g_auto_waveform = !g_auto_waveform;
                 markStateDirty();
                 break;
-            case SR_AUTO_HEAT:
-                g_auto_heatmap = !g_auto_heatmap;
+            case SR_AUTO_SPEC:
+                g_auto_spectrum = !g_auto_spectrum;
                 markStateDirty();
                 break;
             default: break;
@@ -2972,7 +3004,7 @@ void setup() {
     M5Cardputer.Display.setBrightness(userBrightness());
     // M5GFX's autodetect inits the Cardputer panel SPI at 40 MHz. We
     // override after begin() — the bus reconfigures on next transaction.
-    // Walking up to narrow the heatmap push window vs panel scan tear.
+    // Walking up to narrow the spectrum push window vs panel scan tear.
     static constexpr uint32_t PANEL_SPI_HZ = 80000000;
     M5Cardputer.Display.getPanel()->getBus()->setClock(PANEL_SPI_HZ);
     g_last_activity_ms = millis();
@@ -3187,8 +3219,8 @@ void loop() {
                     }
                 }
             }
-        } else if (g_waveform_active || g_heatmap_active || g_viz_test_pattern) {
-            // Visualisation overlay (waveform or heatmap): transport,
+        } else if (g_waveform_active || g_spectrum_active || g_viz_test_pattern) {
+            // Visualisation overlay (waveform or spectrum): transport,
             // volume, and brightness keys pass through so the user can
             // keep controlling playback while watching. Everything else
             // dismisses — the user is leaving the overlay to navigate,
@@ -3201,14 +3233,14 @@ void loop() {
                     else                            dismiss = true;
                 }
             } else if (state.ctrl) {
-                // Ctrl+W and Ctrl+H toggle their own overlay independently
+                // Ctrl+W and Ctrl+S toggle their own overlay independently
                 // — either may turn off (clearing the overlay if it was
                 // the only one active) or turn on (adding the other view
                 // to the dual layout). Empty `word` on key release while
                 // Ctrl is still held is a no-op via the char check.
                 for (char c : state.word) {
                     if      (c == 'W' || c == 'w') toggleWaveform();
-                    else if (c == 'H' || c == 'h') toggleHeatmap();
+                    else if (c == 'S' || c == 's') toggleSpectrum();
                     else if (c == 'T' || c == 't') toggleTestPattern();
                 }
             } else if (state.space) {
@@ -3249,10 +3281,7 @@ void loop() {
                 }
             }
             if (dismiss) {
-                g_waveform_active  = false;
-                g_heatmap_active   = false;
-                g_viz_test_pattern = false;
-                draw();
+                snapshotAndDismissViz();
             }
         } else if (state.fn) {
             // Fn-modified bindings only. Fn+key combos with no binding are
@@ -3260,15 +3289,10 @@ void loop() {
             for (char c : state.word) {
                 switch (c) {
                     case '`':
-                        // Fn+` is labelled "esc" on the keyboard. Dismisses
-                        // whatever overlay is on top — waveform first, then
-                        // search.
-                        if (g_waveform_active) {
-                            g_waveform_active = false;
-                            draw();
-                        } else if (g_search_active) {
-                            exitSearch();
-                        }
+                        // Fn+` is labelled "esc". In-overlay esc is handled by
+                        // the viz-overlay branch (which snapshots and dismisses
+                        // via snapshotAndDismissViz); here, esc exits search.
+                        if (g_search_active) exitSearch();
                         break;
                     // Brightness shortcut. Accepts both the shifted and
                     // unshifted forms so users don't have to remember
@@ -3284,8 +3308,15 @@ void loop() {
             // 'w' arrives as 'W'.
             for (char c : state.word) {
                 if (c == 'W' || c == 'w') toggleWaveform();
-                if (c == 'H' || c == 'h') toggleHeatmap();
+                if (c == 'S' || c == 's') toggleSpectrum();
                 if (c == 'T' || c == 't') toggleTestPattern();
+            }
+        } else if (state.tab) {
+            // Tab outside viz overlay restores the last-shown combination
+            // — flicks the visualisations back in without re-selecting which
+            // ones. The in-overlay Tab branch handles the hide direction.
+            if (!g_show_settings && !g_show_help && !g_search_active) {
+                restoreVizFromSnapshot();
             }
         } else if (state.del) {
             // In search mode, backspace edits the query and exits when

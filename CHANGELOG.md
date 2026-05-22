@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.68 — 2026-05-22
+
+- Visualisation tracks audible playback in near real time. The lookahead headroom (`VIZ_LOOKAHEAD_MS`) was tuned from 500 ms down to 175 ms by visual bisect, moving the displayed column from ~280 ms behind audible to ~45 ms ahead. The stale comment that referenced the original 250 ms design target was rewritten alongside.
+
+## 0.21.67 — 2026-05-22
+
+- Heatmap renamed to spectrum throughout — `Ctrl+S` replaces `Ctrl+H` for the toggle, and the settings row becomes "Auto spectrum". `Tab` now toggles the visualisation overlay during playback, restoring whichever combination of waveform and spectrum was last shown (defaults to both on first press). Every dismiss path captures the snapshot so Tab always brings back what was on screen.
+
 ## 0.21.66 — 2026-05-21
 
 - `enter` is no longer used anywhere. `/` is the single activate key: descend a directory, play an audio entry, activate a search result, activate a Settings action row, or confirm a reset prompt. Fixes a search-mode bug where `/` activated the directory-cursor's entry instead of the highlighted search result.
