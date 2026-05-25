@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.0 — 2026-05-25
+
+- Chess game added as a side activity. `Ctrl+H` enters; type moves in `e2e4` notation; any unconsumed key exits with state preserved. CPU plays a random legal move (PoC; real engine to follow). Board state persists in NVS under its own namespace and survives reboots. Music continues playing while chess is on screen.
+
 ## 0.21.68 — 2026-05-22
 
 - Visualisation tracks audible playback in near real time. The lookahead headroom (`VIZ_LOOKAHEAD_MS`) was tuned from 500 ms down to 175 ms by visual bisect, moving the displayed column from ~280 ms behind audible to ~45 ms ahead. The stale comment that referenced the original 250 ms design target was rewritten alongside.

@@ -2,6 +2,7 @@
 
 [Down](#screen-layout)
 [Down](#playback)
+[Down](#chess)
 [Down](#controls)
 [Down](#persisted-state)
 
@@ -27,6 +28,7 @@ Application
 │ └ Screen Idle (unreviewed)
 ├ Playback
 │ └ Audio Formats
+├ Chess
 ├ Controls
 └ Persisted State
 ```
@@ -281,6 +283,8 @@ The bindings:
 
 - `Ctrl+S` — toggle [Spectrum](#spectrum) overlay during playback
 
+- `Ctrl+H` — enter [Chess](#chess)
+
 - `Tab` — toggle the [Visualisation](#visualisation) overlay during playback; restores the last-shown combination of waveform + spectrum
 
 # Playback
@@ -319,6 +323,30 @@ The supported formats: FLAC, MP3, AAC, M4A, WAV.
 
 - Files with multi-track containers, non-`mp4a` codecs, unsupported AAC profiles (only AOT 1–4), out-of-range sample rates (>12) or channel configs, or 64-bit chunk offsets above 4 GB are rejected at parse.
 
+# Chess
+
+[Up](#application)
+
+A side activity. Standard 8×8 board, the user plays White; moves typed in `e2e4` notation; the CPU replies. State persists across reboots so a game can be paused indefinitely and resumed. The audio task is untouched while chess is on screen, so music keeps playing.
+
+Entered with `Ctrl+H`; exits on `Fn+\`` or any unrecognised keypress, returning to whatever was on screen. Music transport keys are not consumed — they'd exit chess and fire normally. The visualisation overlay snapshot-dismisses on entry; `Tab` restores it afterwards.
+
+**Detail**
+
+- Full legal-move generation: castling, en passant, promotion-to-queen, check / checkmate / stalemate.
+
+- CPU plays a random legal move (PoC — placeholder for a real engine).
+
+- Board state stored in NVS under a separate `chess` namespace.
+
+- Game-over display offers `n` to start a fresh game; any other key exits.
+
+**See also**
+
+- [Controls](#controls) — `Ctrl+H` entry
+
+- [Persisted State](#persisted-state) — NVS storage
+
 # Persisted State
 
 [Up](#application)
@@ -329,6 +357,8 @@ The supported formats: FLAC, MP3, AAC, M4A, WAV.
 User-facing state survives power cycles so volume, volume cap, brightness, current folder + cursor, font size, wrap / diagnostics / hide-non-audio / auto-play-next / auto-waveform / auto-spectrum toggles, idle timeout, and the playing track come back the way they were. On boot the saved track loads paused — playback only starts on space. Intra-track position is not persisted.
 
 Emergency shutdown does not save — persistence runs during normal operation, never as a shutdown step. Whatever was dirty at cutoff is lost.
+
+[Chess](#chess) board state persists under a separate `chess` NVS namespace with its own save path — written on every move rather than via the player-state dirty/flush coalesce, since chess writes are rare.
 
 **Detail**
 

@@ -23,13 +23,14 @@
 #include "audio_output_m5.h"
 #include "fuzzy_harness.h"
 #include "fuzzy_index.h"
+#include "chess.h"
 
 #define SD_SCK  40
 #define SD_MISO 39
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.21.68";
+static constexpr const char* APP_VERSION = "0.22.0";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -312,7 +313,7 @@ static bool g_show_reset_modal    = false;
 // Used to suppress redraws and key handlers that don't apply while an
 // overlay is on top.
 static inline bool overlayActive() {
-    return g_show_help || g_show_settings || g_show_reset_modal;
+    return g_show_help || g_show_settings || g_show_reset_modal || chess::active();
 }
 
 struct FontNotch {
@@ -1121,6 +1122,23 @@ static void restoreVizFromSnapshot() {
     g_spectrum_active = g_last_viz_spectrum;
     g_viz_prev_us = 0;
     g_viz_sprite_dirty = true;
+    draw();
+}
+
+// Chess mode entry / exit. The chess screen owns the panel while active;
+// any visualisation overlay is dismissed (and not auto-restored on exit —
+// the user brings it back with Tab, matching the snapshotAndDismissViz
+// convention).
+static void enterChess() {
+    if (g_waveform_active || g_spectrum_active || g_viz_test_pattern) {
+        snapshotAndDismissViz();
+    }
+    chess::enter();
+    draw();
+}
+
+static void exitChess() {
+    chess::exit();
     draw();
 }
 
@@ -1962,6 +1980,11 @@ static void presentCursorRows(int prev_cursor) {
 }
 
 static void draw() {
+    if (chess::active()) {
+        chess::render(g_canvas);
+        presentFrame();
+        return;
+    }
     auto& d = g_canvas;
     d.fillScreen(BLACK);
     drawHeader();
@@ -3056,6 +3079,7 @@ void setup() {
     // playback resume) runs — each falls back to the compiled-in default
     // when its key is absent or the saved value is no longer reachable.
     loadState();
+    chess::initAtBoot();
 
     // Apply persisted brightness to the panel — and re-seed the ramp
     // state to match — now that loadState has updated g_brightness_idx.
@@ -3161,7 +3185,18 @@ void loop() {
             drawHeader();
         }
 
-        if (g_show_reset_modal) {
+        if (chess::active()) {
+            // Chess owns the keyboard while up. handleKey returns true when
+            // the key was consumed; a false return means the user pressed
+            // something chess doesn't recognise, so we drop the mode and
+            // let the next press land in the regular dispatch.
+            bool kept = chess::handleKey(state);
+            if (!kept) {
+                exitChess();
+            } else {
+                draw();
+            }
+        } else if (g_show_reset_modal) {
             // `/` confirms the destructive action; any other key — letter,
             // del, space, anything — cancels and dismisses.
             bool confirm = false;
@@ -3310,6 +3345,7 @@ void loop() {
                 if (c == 'W' || c == 'w') toggleWaveform();
                 if (c == 'S' || c == 's') toggleSpectrum();
                 if (c == 'T' || c == 't') toggleTestPattern();
+                if (c == 'H' || c == 'h') enterChess();
             }
         } else if (state.tab) {
             // Tab outside viz overlay restores the last-shown combination
