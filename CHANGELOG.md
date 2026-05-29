@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.22.11 — 2026-05-28
+
+- Chess: Tab while in chess cycles CPU difficulty Easy → Medium → Hard → Easy without leaving the game. The side panel now shows the current level permanently. Persistence reuses the Settings row's path, so the value sticks across reboots and is reflected back in Settings → Chess level.
+
+## 0.22.10 — 2026-05-28
+
+- Chess: Ctrl+R while in chess opens a yellow-framed "RESET GAME?" confirmation. Return commits a fresh game; any other key (including Esc) dismisses the prompt without changing the board. Provides an explicit reset path that previously only existed implicitly via reaching mate / stalemate.
+
+## 0.22.8 — 2026-05-28
+
+- Internal: ESP-IDF IPC task stacks bumped from 2 KB to 4 KB to clear an intermittent boot-time canary panic on ipc1. The previous 2 KB sizing was sitting right at the cliff edge with no visibility; a new probe in `setup()` now reads `uxTaskGetStackHighWaterMark` for `ipc0` / `ipc1` and surfaces the peak both on serial (`[ipc] ipc0 min_free=... ipc1 min_free=...`) and on the diagnostics overlay (replacing the per-core CPU text, redundant with the CPU sparkline). Boot peak is deterministic per binary; current ipc1 peak ~1 KB used, leaving ~3 KB headroom.
+- Chess difficulty setting (Easy / Medium / Hard). Easy searches two ply and picks randomly from the top three scoring moves, with quiescence off — varied games and tactical blindness. Medium is depth 4 with best-move-only and quiescence on. Hard is the 0.22.4 engine unchanged (depth 8, best move, quiescence on). Settings row "Chess level"; default Hard so existing installs roll forward without resetting. Persisted in the chess NVS namespace.
+
+## 0.22.6 — 2026-05-28
+
+- Chess board cosmetics. Pieces are bitmap sprites instead of letters. Square palette retuned for better piece contrast (lighter dark / darker light squares). Cursor outline turns blue while picking and cyan while placing, signalling what the next enter press will do. Held-piece outline rewritten in yellow at matching dimensions. File / rank labels removed; panel widens from 96 to 106 px.
+
+## 0.22.4 — 2026-05-26
+
+- Chess CPU now actually plays. Iterative-deepening alpha-beta search with material + piece-square table evaluation and quiescence at the horizon, time-bounded to 5 s per move and depth-capped at 8. Targets coached-beginner strength (~1400–1600 Elo). The "thinking" indicator from 0.22.3 becomes meaningful — the CPU now spends real time before moving. RAM usage 24.5% → 30.3% (24 KB BSS for the per-ply move stack); flash unchanged in relative terms.
+
+## 0.22.3 — 2026-05-26
+
+- Chess: persistent turn indicator removed (the CPU replies instantly, so "whose turn" carried no information). Replaced with a static "thinking" label in the top-right of the side panel, shown only while the CPU is computing. Currently flashes for one frame because the engine is trivial; will become a meaningful indicator once a real engine lands.
+
+## 0.22.1 — 2026-05-25
+
+- Chess: visual cursor replaces typed `e2e4` notation. `;` `.` `,` `/` move a cyan square selector around the board; `enter` picks a piece (yellow inner outline marks it held), a second `enter` places. `del` cancels a pick-up. Illegal target squares are a silent no-op — the held piece stays held so you can re-aim without re-picking.
+
 ## 0.22.0 — 2026-05-25
 
 - Chess game added as a side activity. `Ctrl+H` enters; type moves in `e2e4` notation; any unconsumed key exits with state preserved. CPU plays a random legal move (PoC; real engine to follow). Board state persists in NVS under its own namespace and survives reboots. Music continues playing while chess is on screen.

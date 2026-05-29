@@ -20,6 +20,18 @@ void enter();               // become active; redraws
 void exit();                // become inactive; saves state
 bool active();
 
+// CPU difficulty. Persists in the chess NVS namespace. Default HARD —
+// matches the full-strength engine.
+enum Difficulty : int8_t { EASY = 0, MEDIUM = 1, HARD = 2 };
+Difficulty getDifficulty();
+void       setDifficulty(Difficulty d);
+
+// Register a host-supplied "render chess and push the frame" callback.
+// chess uses this to flush a spinner frame before invoking the CPU move
+// — necessary because cpuMove() may eventually run long enough that the
+// caller's post-handleKey redraw would arrive too late to give feedback.
+void setRedrawCallback(void (*cb)());
+
 // Repaint the chess screen. Caller is responsible for presenting the canvas.
 void render(M5Canvas& canvas);
 

@@ -30,7 +30,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.22.0";
+static constexpr const char* APP_VERSION = "0.22.11";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -472,9 +472,17 @@ static int g_diag_buf_pct  = 0;
 static int g_diag_ram_pct  = 0;
 static int g_diag_largest_pct = 0;  // largest contiguous free block / total heap
 static int g_diag_minfree_pct = 0;  // (total - low-water-mark free) / total — peak pressure since boot
-static int g_diag_cpu0_pct = 0;
-static int g_diag_cpu1_pct = 0;
 static int g_diag_imu_mg   = 0;   // latest IMU delta magnitude in mg
+
+// ESP-IDF per-core IPC tasks. System code (not ours) runs on these to
+// service cross-core requests — most notably interrupt allocation during
+// boot. The stack peak crept past the configured size once before; we
+// surface the current high-water-mark free bytes so creep is visible
+// before it tips into a canary panic at boot.
+static TaskHandle_t g_ipc_task_0      = nullptr;
+static TaskHandle_t g_ipc_task_1      = nullptr;
+static uint32_t     g_diag_ipc0_free  = 0;
+static uint32_t     g_diag_ipc1_free  = 0;
 
 // CPU sampling: each core's IDLE task carries a run-time counter (in real
 // microseconds) thanks to FreeRTOS run-time-stats being enabled at the
@@ -881,14 +889,16 @@ static void drawDiagnosticsRow() {
     d.setCursor(DIAG_NUM_COL1_X, DIAG_ROW4_Y);
     d.printf("u:%u", (unsigned)g_diag_underruns);
 
-    // Right column: per-core CPU (tinted) over heap fragmentation /
-    // peak-pressure markers.
+    // Right column: per-core IPC task stack free bytes (tinted), then
+    // idle countdown / IMU motion in the remaining slots. The CPU sparkline
+    // to the right of these cells carries the per-core load — these slots
+    // used to mirror it as text, but that was redundant.
     d.setTextColor(0x07FF, BLACK);
     d.setCursor(DIAG_NUM_COL2_X, DIAG_ROW1_Y);
-    d.printf("c0:%d%%", g_diag_cpu0_pct);
+    d.printf("i0:%u", (unsigned)g_diag_ipc0_free);
     d.setTextColor(0xFC00, BLACK);
     d.setCursor(DIAG_NUM_COL2_X, DIAG_ROW2_Y);
-    d.printf("c1:%d%%", g_diag_cpu1_pct);
+    d.printf("i1:%u", (unsigned)g_diag_ipc1_free);
     d.setTextColor(COL_DIAG_TXT, BLACK);
     d.setCursor(DIAG_NUM_COL2_X, DIAG_ROW3_Y);
     // `to` — seconds remaining before the idle fade fires. `-` when the
@@ -1060,8 +1070,15 @@ static void pollDiagnostics() {
     float load1 = 1.0f - idle1;
     sparklinePush(g_spark_cpu0, load0);
     sparklinePush(g_spark_cpu1, load1);
-    g_diag_cpu0_pct = (int)(100.0f * load0 + 0.5f);
-    g_diag_cpu1_pct = (int)(100.0f * load1 + 0.5f);
+
+    if (g_ipc_task_0) {
+        UBaseType_t hw = uxTaskGetStackHighWaterMark(g_ipc_task_0);
+        g_diag_ipc0_free = (uint32_t)hw * sizeof(StackType_t);
+    }
+    if (g_ipc_task_1) {
+        UBaseType_t hw = uxTaskGetStackHighWaterMark(g_ipc_task_1);
+        g_diag_ipc1_free = (uint32_t)hw * sizeof(StackType_t);
+    }
 
     if (overlayActive() || g_diagnostics_hidden) return;
     // Re-render the entire header so the path/version text is fresh
@@ -2688,10 +2705,12 @@ static void showResetModal();  // defined below
 
 enum SettingsRowId {
     SR_DIAG = 0, SR_WRAP, SR_HIDE_NA, SR_AUTO_NEXT, SR_AUTO_WAVE, SR_AUTO_SPEC,
-    SR_FONT, SR_VOLMAX, SR_BRIGHT, SR_IDLE,
+    SR_FONT, SR_VOLMAX, SR_BRIGHT, SR_IDLE, SR_CHESS_LEVEL,
     SR_KEY_REF, SR_REBUILD, SR_RESET,
     SR_COUNT
 };
+
+static const char* CHESS_LEVEL_LABELS[3] = { "Easy", "Medium", "Hard" };
 enum SettingsRowKind { SRK_TOGGLE, SRK_NUMERIC, SRK_ACTION };
 
 struct SettingsRow {
@@ -2710,6 +2729,7 @@ static const SettingsRow SETTINGS_ROWS[SR_COUNT] = {
     {SRK_NUMERIC, "Volume max"},
     {SRK_NUMERIC, "Brightness"},
     {SRK_NUMERIC, "Backlight off"},
+    {SRK_NUMERIC, "Chess level"},
     {SRK_ACTION,  "Key reference"},
     {SRK_ACTION,  "Rebuild index"},
     {SRK_ACTION,  "Reset all"},
@@ -2734,6 +2754,9 @@ static void settingsRowNumStr(SettingsRowId id, char* buf, size_t buflen) {
         case SR_BRIGHT: snprintf(buf, buflen, "%d", userBrightness()); break;
         case SR_IDLE:
             snprintf(buf, buflen, "%s", IDLE_TIMEOUT_LABELS[g_idle_timeout_idx]);
+            break;
+        case SR_CHESS_LEVEL:
+            snprintf(buf, buflen, "%s", CHESS_LEVEL_LABELS[chess::getDifficulty()]);
             break;
         default: buf[0] = '\0'; break;
     }
@@ -2949,6 +2972,14 @@ static void adjustSettingsRow(int delta) {
             markStateDirty();
             break;
         }
+        case SR_CHESS_LEVEL: {
+            int n = (int)chess::getDifficulty() + delta;
+            if (n < chess::EASY) n = chess::EASY;
+            if (n > chess::HARD) n = chess::HARD;
+            if (n == (int)chess::getDifficulty()) return;
+            chess::setDifficulty((chess::Difficulty)n);
+            break;
+        }
         default: return;
     }
     drawSettings();
@@ -3080,6 +3111,7 @@ void setup() {
     // when its key is absent or the saved value is no longer reachable.
     loadState();
     chess::initAtBoot();
+    chess::setRedrawCallback([]() { draw(); });
 
     // Apply persisted brightness to the panel — and re-seed the ramp
     // state to match — now that loadState has updated g_brightness_idx.
@@ -3149,6 +3181,17 @@ void setup() {
     g_idle_task_0 = xTaskGetIdleTaskHandleForCPU(0);
     g_idle_task_1 = xTaskGetIdleTaskHandleForCPU(1);
     g_cpu_sample_us_prev = esp_timer_get_time();
+
+    g_ipc_task_0 = xTaskGetHandle("ipc0");
+    g_ipc_task_1 = xTaskGetHandle("ipc1");
+    if (g_ipc_task_0 && g_ipc_task_1) {
+        uint32_t free0 = (uint32_t)uxTaskGetStackHighWaterMark(g_ipc_task_0)
+                         * sizeof(StackType_t);
+        uint32_t free1 = (uint32_t)uxTaskGetStackHighWaterMark(g_ipc_task_1)
+                         * sizeof(StackType_t);
+        Serial.printf("[ipc] ipc0 min_free=%u ipc1 min_free=%u\n",
+                      (unsigned)free0, (unsigned)free1);
+    }
 
     pollBattery(true);
     draw();
