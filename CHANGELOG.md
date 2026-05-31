@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.23 — 2026-05-31
+
+- RTC. On-screen wall clock in the diagnostics overlay (bottom-right cell, replaces the `im:` IMU magnitude readout — motion still surfaces via the activity-timeout countdown above it). Reads from an M5Stack HYM8563 RTC Unit on Port A (Grove I²C, GPIO 2/1) via `m5stack/M5Unit-RTC`. Seeded on first boot from the firmware's build timestamp; the chip then keeps time across reboots, and across full power-off if the unit's CR1220 coin cell is fitted. Lays foundation for an upcoming alarm-clock feature.
+
 ## 0.22.11 — 2026-05-28
 
 - Chess: Tab while in chess cycles CPU difficulty Easy → Medium → Hard → Easy without leaving the game. The side panel now shows the current level permanently. Persistence reuses the Settings row's path, so the value sticks across reboots and is reflected back in Settings → Chess level.

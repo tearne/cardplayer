@@ -1,4 +1,5 @@
 #include <M5Cardputer.h>
+#include <Unit_RTC.h>
 #include <SPI.h>
 #include <SD.h>
 #include <vector>
@@ -30,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.22.11";
+static constexpr const char* APP_VERSION = "0.22.23";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -473,6 +474,7 @@ static int g_diag_ram_pct  = 0;
 static int g_diag_largest_pct = 0;  // largest contiguous free block / total heap
 static int g_diag_minfree_pct = 0;  // (total - low-water-mark free) / total — peak pressure since boot
 static int g_diag_imu_mg   = 0;   // latest IMU delta magnitude in mg
+static char g_diag_clk[9]  = "--:--:--";  // HH:MM:SS from external RTC, refreshed once per second
 
 // ESP-IDF per-core IPC tasks. System code (not ours) runs on these to
 // service cross-core requests — most notably interrupt allocation during
@@ -913,9 +915,10 @@ static void drawDiagnosticsRow() {
         d.printf("to:%ds", remain_s);
     }
     d.setCursor(DIAG_NUM_COL2_X, DIAG_ROW4_Y);
-    // `im` — last IMU delta magnitude in mg. Compare against 50 mg
-    // threshold; values that exceed it have already marked activity.
-    d.printf("im:%d", g_diag_imu_mg);
+    // RTC wall clock — verifies the Port-A HYM8563 is keeping time without
+    // needing a serial monitor. Replaces the IMU magnitude readout: motion
+    // events that exceed threshold already surface via the `to:` countdown.
+    d.print(g_diag_clk);
 
     // CPU sparkline at full row-2 height — 32 vertical levels for 0–100 %,
     // double the y-resolution of the previous 16 px graph.
@@ -3051,6 +3054,54 @@ static void enterBatteryLowState() {
     M5.Power.powerOff();
 }
 
+static Unit_RTC g_rtc;
+
+static bool parseCompileDateTime(rtc_date_type& d, rtc_time_type& t) {
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char mon[4] = { __DATE__[0], __DATE__[1], __DATE__[2], 0 };
+    const char* ms = strstr(months, mon);       // __DATE__: "Mmm DD YYYY"
+    if (!ms) return false;
+    d.Month   = ((ms - months) / 3) + 1;
+    d.Date    = atoi(__DATE__ + 4);             // day (space-padded ok)
+    d.Year    = atoi(__DATE__ + 7);
+    d.WeekDay = 0;                              // unknown without calendar math
+    t.Hours   = atoi(__TIME__ + 0);             // __TIME__: "HH:MM:SS"
+    t.Minutes = atoi(__TIME__ + 3);
+    t.Seconds = atoi(__TIME__ + 6);
+    return true;
+}
+
+static void seedRtcIfUnset() {
+    rtc_date_type d; rtc_time_type t;
+    g_rtc.getDate(&d);
+    if (d.Year >= 2025) return;                 // already seeded on a prior boot
+    if (!parseCompileDateTime(d, t)) return;
+    g_rtc.setDate(&d);
+    g_rtc.setTime(&t);
+    Serial.printf("[rtc] seeded from build timestamp: %04u-%02u-%02u %02u:%02u:%02u\n",
+                  d.Year, d.Month, d.Date, t.Hours, t.Minutes, t.Seconds);
+}
+
+static void pollRtcClock() {
+    static uint32_t last_ms = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - last_ms) < 1000) return;
+    last_ms = now;
+    rtc_time_type t;
+    g_rtc.getTime(&t);
+    snprintf(g_diag_clk, sizeof(g_diag_clk), "%02u:%02u:%02u",
+             t.Hours, t.Minutes, t.Seconds);
+}
+
+static void setupRtc() {
+    // Cardputer ADV Port A: SDA=GPIO2, SCL=GPIO1. Init Wire as master ourselves;
+    // Unit_RTC's 4-arg begin() invokes the Wire slave-mode overload (library
+    // bug — TODO: upstream a fix to m5stack/M5Unit-RTC).
+    Wire.begin(/*sda=*/2, /*scl=*/1, /*freq=*/100000);
+    g_rtc.begin(&Wire);
+    seedRtcIfUnset();
+}
+
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
@@ -3193,6 +3244,8 @@ void setup() {
                       (unsigned)free0, (unsigned)free1);
     }
 
+    setupRtc();
+
     pollBattery(true);
     draw();
 
@@ -3208,6 +3261,7 @@ void loop() {
     pollIndexingSpinner();
     // pollVisualisation() now runs in its own RTOS task — see vizTask.
     pollIMUActivity();
+    pollRtcClock();
     pollIdleScreen();
     pollBrightnessRamp();
     fuzzyHarnessPoll();
