@@ -31,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.22.23";
+static constexpr const char* APP_VERSION = "0.23.12";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -182,6 +182,9 @@ static constexpr uint16_t COL_FOOTER_FRAME = 0x6979;  // hairline above footer
 // pieces read as a continuous palette.
 static constexpr uint16_t COL_BROWSE_FRAME = 0x6979;  // slate-blue
 static constexpr uint16_t COL_SEARCH_FRAME = 0x652D;  // slate-green
+// Track-pick mode reuses the Settings yellow so picking reads as a settings
+// activity, not normal browse: blue = browse, green = search, yellow = pick.
+static constexpr uint16_t COL_PICK_FRAME   = 0xA520;  // slate-yellow
 
 // Off-screen back buffer. All draw operations target g_canvas; once a frame
 // is composed, presentFrame() pushes it to the panel in one operation, so
@@ -238,6 +241,40 @@ static int  g_indexing_phase     = 0;
 static uint32_t g_indexing_last_ms = 0;
 static bool g_show_settings  = false;
 static bool g_show_help      = false;  // key reference sub-screen (reached from settings)
+static bool g_standby_active = false;  // full-screen clock at standby brightness
+static bool g_alarm_firing   = false;  // alarm sounding (set by pollAlarms, cleared on dismiss/auto-stop)
+static bool g_alarm_snoozing = false;  // snoozed mid-fire; full-screen clock continues at standby brightness
+static bool g_show_alarms    = false;  // Alarms sub-menu (from Settings → Alarms...)
+static int  g_alarms_cursor  = 0;
+static bool g_show_alarm_editor = false;
+static int  g_alarm_editor_slot = 0;
+static int  g_alarm_editor_cursor = 0;
+static int  g_alarm_editor_top = 0;  // first visible row; the Track row's
+                                     // variable height needs running-y scroll
+static bool g_show_days_editor = false;  // Days toggles, nested under the editor
+static int  g_days_editor_cursor = 0;
+// Preview state — forward-declared here so activateAlarmEditorRow can set
+// it; the firing logic lives near the fire helpers below.
+static uint32_t g_alarm_preview_fire_at_ms = 0;
+static int      g_alarm_preview_slot = -1;
+// RTC defined here (rather than next to its helpers below) so the alarm
+// editor / set-time / pollAlarms code can reach it.
+static Unit_RTC g_rtc;
+// Track picker — when `g_pick_slot >= 0` the browser is in pick mode:
+// activating an audio file sets that slot's track and returns to the
+// editor; navigation otherwise behaves as normal.
+static int g_pick_slot = -1;
+static std::string g_pick_saved_path;
+static int         g_pick_saved_cursor = 0;
+// Set-current-time editor: draft values held in these globals while the
+// user adjusts; committed to the RTC on the Commit action row.
+static bool     g_show_set_time = false;
+static int      g_sct_cursor = 0;
+static uint16_t g_sct_year   = 2026;
+static uint8_t  g_sct_month  = 1;
+static uint8_t  g_sct_day    = 1;
+static uint8_t  g_sct_hour   = 0;
+static uint8_t  g_sct_min    = 0;
 static int  g_help_top       = 0;
 static int  g_settings_cursor = 0;
 static bool g_hide_non_audio = true;
@@ -283,7 +320,16 @@ static constexpr uint8_t BRIGHTNESS_LEVELS[BRIGHTNESS_COUNT] = {
     6, 7, 8, 16, 32, 64, 128, 192, 255
 };
 static int g_brightness_idx = BRIGHTNESS_COUNT - 1;
-static inline uint8_t userBrightness() { return BRIGHTNESS_LEVELS[g_brightness_idx]; }
+// Standby/clock-mode brightness is intentionally capped low: bedside use
+// + battery life dominate, and the backlight is the biggest power draw.
+// STANDBY_BRIGHTNESS_MAX_IDX caps the ladder index user-side; values in
+// BRIGHTNESS_LEVELS[0..max] = {6, 7, 8, 16} are all dim levels — the warm
+// red/orange palette reads as quite dim, so the cap goes one notch higher
+// than the literal PWM-8 ceiling.
+static constexpr int STANDBY_BRIGHTNESS_MAX_IDX = 3;
+static int g_standby_brightness_idx = 3;  // PWM 16
+static inline uint8_t userBrightness()    { return BRIGHTNESS_LEVELS[g_brightness_idx]; }
+static inline uint8_t standbyBrightness() { return BRIGHTNESS_LEVELS[g_standby_brightness_idx]; }
 
 // Ramp durations: slow when fading out so the transition reads as
 // intentional rather than a glitch; quick when waking so the response
@@ -313,8 +359,13 @@ static bool g_show_reset_modal    = false;
 // modal) is occluding the normal browser/header/footer composition.
 // Used to suppress redraws and key handlers that don't apply while an
 // overlay is on top.
+static inline bool fullScreenClockActive() {
+    return g_standby_active || g_alarm_firing || g_alarm_snoozing;
+}
 static inline bool overlayActive() {
-    return g_show_help || g_show_settings || g_show_reset_modal || chess::active();
+    return g_show_help || g_show_settings || g_show_reset_modal || chess::active()
+        || fullScreenClockActive() || g_show_alarms || g_show_alarm_editor
+        || g_show_days_editor || g_show_set_time;
 }
 
 struct FontNotch {
@@ -338,6 +389,8 @@ static inline int footerH()  { return 10; }
 static inline int browserY() { return headerH(); }
 static inline int browserH() { return SCREEN_H - headerH() - footerH(); }
 static inline int footerY()  { return headerH() + browserH(); }
+// Frame colour follows the active browse context (see COL_PICK_FRAME).
+static inline uint16_t browseFrameColor() { return (g_pick_slot >= 0) ? COL_PICK_FRAME : COL_BROWSE_FRAME; }
 
 enum EntryKind { KIND_DIR, KIND_AUDIO, KIND_OTHER };
 struct Entry { std::string name; EntryKind kind; };
@@ -711,6 +764,20 @@ static bool               g_state_dirty = false;
 static uint32_t           g_state_dirty_since_ms = 0;
 static constexpr uint32_t PERSIST_FLUSH_MS = 5000;
 
+// Alarms — five slots; each is independent and persisted in `player` NVS.
+// `enabled=false` disarms a slot without losing its configuration.
+struct Alarm {
+    uint8_t  hour    = 7;
+    uint8_t  minute  = 0;
+    uint8_t  days    = 0;     // bitmask Mon=bit0..Sun=bit6
+    uint8_t  volume  = 8;
+    uint8_t  ramp_s  = 0;     // 0..60; 0 disables ramp
+    bool     enabled = false;
+    std::string track;        // absolute path; empty → beep fallback
+};
+static constexpr int ALARM_COUNT = 5;
+static Alarm g_alarms[ALARM_COUNT];
+
 // Playhead resume — saved byte offset within the currently-playing track,
 // loaded from NVS at boot and applied after startPlayback succeeds. After
 // boot-resume the value is consumed; subsequent flushes write the live
@@ -750,6 +817,19 @@ static void loadState() {
     g_volume_max         = g_prefs.getInt   ("volmax", g_volume_max);
     g_idle_timeout_idx   = g_prefs.getInt   ("idleto", g_idle_timeout_idx);
     g_brightness_idx     = g_prefs.getInt   ("bright", g_brightness_idx);
+    g_standby_brightness_idx = g_prefs.getInt("stbybr", g_standby_brightness_idx);
+    for (int i = 0; i < ALARM_COUNT; ++i) {
+        char k[8];
+        snprintf(k, sizeof(k), "a%d_hm", i);
+        uint16_t hm = g_prefs.getUShort(k, (uint16_t)((g_alarms[i].hour << 8) | g_alarms[i].minute));
+        g_alarms[i].hour   = (hm >> 8) & 0xFF;
+        g_alarms[i].minute =  hm       & 0xFF;
+        snprintf(k, sizeof(k), "a%d_d", i);   g_alarms[i].days    = g_prefs.getUChar(k, g_alarms[i].days);
+        snprintf(k, sizeof(k), "a%d_v", i);   g_alarms[i].volume  = g_prefs.getUChar(k, g_alarms[i].volume);
+        snprintf(k, sizeof(k), "a%d_r", i);   g_alarms[i].ramp_s  = g_prefs.getUChar(k, g_alarms[i].ramp_s);
+        snprintf(k, sizeof(k), "a%d_e", i);   g_alarms[i].enabled = g_prefs.getUChar(k, 0) != 0;
+        snprintf(k, sizeof(k), "a%d_t", i);   g_alarms[i].track   = std::string(g_prefs.getString(k, "").c_str());
+    }
     g_cur_path           = std::string(g_prefs.getString("folder", g_cur_path.c_str()).c_str());
     g_cursor             = g_prefs.getInt   ("cursor", g_cursor);
     g_play_path          = std::string(g_prefs.getString("track",  g_play_path.c_str()).c_str());
@@ -762,6 +842,15 @@ static void loadState() {
     if (g_volume > g_volume_max) g_volume = g_volume_max;
     if (g_idle_timeout_idx < 0 || g_idle_timeout_idx >= IDLE_TIMEOUT_COUNT) g_idle_timeout_idx = 2;
     if (g_brightness_idx   < 0 || g_brightness_idx   >= BRIGHTNESS_COUNT)   g_brightness_idx   = BRIGHTNESS_COUNT - 1;
+    if (g_standby_brightness_idx < 0) g_standby_brightness_idx = 0;
+    if (g_standby_brightness_idx > STANDBY_BRIGHTNESS_MAX_IDX) g_standby_brightness_idx = STANDBY_BRIGHTNESS_MAX_IDX;
+    for (int i = 0; i < ALARM_COUNT; ++i) {
+        Alarm& a = g_alarms[i];
+        if (a.hour > 23)   a.hour = 7;
+        if (a.minute > 59) a.minute = 0;
+        if (a.ramp_s > 60) a.ramp_s = 0;
+        if (a.volume > MAX_VOL) a.volume = 8;
+    }
 }
 
 static void flushStateIfDirty() {
@@ -780,6 +869,17 @@ static void flushStateIfDirty() {
     g_prefs.putInt   ("volmax", g_volume_max);
     g_prefs.putInt   ("idleto", g_idle_timeout_idx);
     g_prefs.putInt   ("bright", g_brightness_idx);
+    g_prefs.putInt   ("stbybr", g_standby_brightness_idx);
+    for (int i = 0; i < ALARM_COUNT; ++i) {
+        char k[8];
+        snprintf(k, sizeof(k), "a%d_hm", i);
+        g_prefs.putUShort(k, (uint16_t)((g_alarms[i].hour << 8) | g_alarms[i].minute));
+        snprintf(k, sizeof(k), "a%d_d", i);   g_prefs.putUChar (k, g_alarms[i].days);
+        snprintf(k, sizeof(k), "a%d_v", i);   g_prefs.putUChar (k, g_alarms[i].volume);
+        snprintf(k, sizeof(k), "a%d_r", i);   g_prefs.putUChar (k, g_alarms[i].ramp_s);
+        snprintf(k, sizeof(k), "a%d_e", i);   g_prefs.putUChar (k, g_alarms[i].enabled ? 1 : 0);
+        snprintf(k, sizeof(k), "a%d_t", i);   g_prefs.putString(k, g_alarms[i].track.c_str());
+    }
     g_prefs.putString("folder", g_cur_path.c_str());
     g_prefs.putInt   ("cursor", g_cursor);
     g_prefs.putString("track",  g_play_path.c_str());
@@ -1212,6 +1312,9 @@ static void pollBrightnessRamp() {
 // brightness (over a short ramp) if it was dimmed or off.
 static void markActivity() {
     g_last_activity_ms = millis();
+    // Standby and alarm-firing screens own their own brightness — wake-up
+    // ramps would fight enterStandby/exitStandby and flash the user.
+    if (fullScreenClockActive()) return;
     if (g_screen_state != SCREEN_FULL) {
         bool was_off = (g_screen_state == SCREEN_OFF);
         g_screen_state = SCREEN_FULL;
@@ -1259,6 +1362,9 @@ static void pollIMUActivity() {
 static void pollIdleScreen() {
     if (!idleEnabled()) return;
     if (g_screen_state != SCREEN_FULL) return;
+    // Standby and alarm-firing screens own their own brightness; the idle
+    // FSM stays out of the way until the user exits them.
+    if (fullScreenClockActive()) return;
     uint32_t idle = millis() - g_last_activity_ms;
     if (idle >= idleOffMs()) {
         g_screen_state = SCREEN_FADING;
@@ -1267,6 +1373,12 @@ static void pollIdleScreen() {
 }
 
 // Forward decls — canvas-side viz helpers defined further down.
+static void drawClockScreen();
+static void enterAlarms();
+static void exitAlarms();
+static void enterAlarmEditor(int slot);
+static void enterStandby();
+static uint8_t dayOfWeekMonFirst(uint16_t y, uint8_t m, uint8_t d);
 static void fullRedrawVizIntoCanvas(int by, int inner_h);
 static void drawVizColIntoCanvas(int y_top, int inner_h, int x, uint64_t col_abs);
 
@@ -1276,6 +1388,10 @@ static void drawVizColIntoCanvas(int y_top, int inner_h, int x, uint64_t col_abs
 static void pollVisualisation() {
     if (!g_waveform_active && !g_spectrum_active && !g_viz_test_pattern) return;
     if (g_screen_state == SCREEN_OFF) return;
+    // The full-screen clock (standby / alarm firing / snooze) owns the whole
+    // panel; viz columns would overpaint it. State is left intact so the
+    // visualisation resumes when the clock screen exits.
+    if (overlayActive()) return;
     uint32_t now_us = micros();
     uint64_t abs    = g_out.spectrumRing().abs_head;
 
@@ -1477,18 +1593,22 @@ static void drawSlotVolume() {
     int fh = footerH();
     int by = fy + (fh - FOOTER_BAR_H) / 2;
     d.fillRect(FOOTER_VOL_X, fy, FOOTER_VOL_W, fh, BLACK);
-    d.drawRect(FOOTER_VOL_X, by, FOOTER_VOL_W, FOOTER_BAR_H, COL_FOOTER_VOL);
-    int inner = FOOTER_VOL_W - 2;
-    // Scale to the user's volume max (not absolute MAX_VOL) so a "full"
-    // bar reflects what the user has chosen as their loudest, not the
-    // hardware ceiling. With the cap at MAX_VOL the bar fills the same
-    // way as before.
+    // Two-char numeric to the left of the bar (e.g. "12"), so the user
+    // builds muscle memory for their preferred level.
+    constexpr int NUM_W = 2 * BASE_CHAR_W + 1;  // "NN" + 1 px gap
+    int bar_x = FOOTER_VOL_X + NUM_W;
+    int bar_w = FOOTER_VOL_W - NUM_W;
+    d.setTextSize(1);
+    d.setTextColor(COL_FOOTER_VOL, BLACK);
+    d.setCursor(FOOTER_VOL_X, fy + (fh - 8) / 2);
+    d.printf("%2d", g_volume);
+    d.drawRect(bar_x, by, bar_w, FOOTER_BAR_H, COL_FOOTER_VOL);
+    int inner = bar_w - 2;
     int denom = (g_volume_max > 0) ? g_volume_max : 1;
     int w = (g_volume * inner) / denom;
     if (w > inner) w = inner;
     if (w > 0) {
-        d.fillRect(FOOTER_VOL_X + 1, by + 1, w, FOOTER_BAR_H - 2,
-                   COL_FOOTER_VOL);
+        d.fillRect(bar_x + 1, by + 1, w, FOOTER_BAR_H - 2, COL_FOOTER_VOL);
     }
 }
 
@@ -1562,7 +1682,11 @@ static void drawEntry(int x, int col_w, int y, const Entry& e,
     int rh    = rowH();
     int h     = rows * rh;
 
-    uint16_t bg = selected ? COL_SELECTION_BG : BLACK;
+    // Pick mode (browsing to pick an alarm track) uses the Settings yellow
+    // selection so the user sees at a glance that `/` here picks rather than
+    // plays — a different affordance for the same key.
+    uint16_t sel_bg_col = (g_pick_slot >= 0) ? COL_SETTINGS_SEL_BG : COL_SELECTION_BG;
+    uint16_t bg = selected ? sel_bg_col : BLACK;
     uint16_t fg = kindColour(e.kind);
 
     d.fillRect(x, y, col_w, h, bg);
@@ -1664,7 +1788,7 @@ static void drawScrollbar(int visible, int total) {
     int thumb_top = by + (int)((int64_t)(track_h - thumb_h) * g_top / (total - visible));
     if (thumb_top < by) thumb_top = by;
     if (thumb_top + thumb_h > by + track_h) thumb_top = by + track_h - thumb_h;
-    d.fillRect(SCROLLBAR_X, thumb_top, SCROLLBAR_W, thumb_h, COL_BROWSE_FRAME);
+    d.fillRect(SCROLLBAR_X, thumb_top, SCROLLBAR_W, thumb_h, browseFrameColor());
 }
 
 // Render the browser onto the canvas. Does not push to the panel — callers
@@ -1694,8 +1818,8 @@ static void composeBrowser() {
         int visible = drawColumn(0, COL_W, g_entries, g_cursor, g_top);
         drawScrollbar(visible, (int)g_entries.size());
     }
-    d.drawFastHLine(0, by,          SCREEN_W, COL_BROWSE_FRAME);
-    d.drawFastHLine(0, by + bh - 1, SCREEN_W, COL_BROWSE_FRAME);
+    d.drawFastHLine(0, by,          SCREEN_W, browseFrameColor());
+    d.drawFastHLine(0, by + bh - 1, SCREEN_W, browseFrameColor());
 }
 
 static void drawBrowser() {
@@ -2000,6 +2124,10 @@ static void presentCursorRows(int prev_cursor) {
 }
 
 static void draw() {
+    if (fullScreenClockActive()) {
+        drawClockScreen();
+        return;
+    }
     if (chess::active()) {
         chess::render(g_canvas);
         presentFrame();
@@ -2136,6 +2264,8 @@ static bool startPlayback(const std::string& full_path, bool start_paused = fals
     return true;
 }
 
+static void exitPickMode(bool restore_path);
+
 static void activateSelection() {
     if (g_entries.empty()) return;
     const Entry& e = g_entries[g_cursor];
@@ -2144,11 +2274,36 @@ static void activateSelection() {
         draw();
     } else if (e.kind == KIND_AUDIO) {
         std::string full = joinPath(g_cur_path, e.name);
+        if (g_pick_slot >= 0) {
+            // Pick-mode commit: set the alarm slot's track to this file and
+            // return to the editor, restoring the browser to where it was
+            // before the pick — choosing an alarm track is a Settings detour
+            // and shouldn't move the user's music-browsing position.
+            g_alarms[g_pick_slot].track = full;
+            markStateDirty();
+            int slot = g_pick_slot;
+            exitPickMode(/*restore_path=*/true);
+            enterAlarmEditor(slot);
+            return;
+        }
         // `/` on any audio entry — including the currently-playing one —
         // starts it from the beginning. Pause/resume stays on `space`.
         startPlayback(full);
         drawFooter();
     }
+}
+
+static void exitPickMode(bool restore_path) {
+    if (g_pick_slot < 0) return;
+    int slot = g_pick_slot;
+    g_pick_slot = -1;
+    if (restore_path) {
+        loadDir(g_pick_saved_path);
+        g_cursor = g_pick_saved_cursor;
+        if (g_cursor >= (int)g_entries.size()) g_cursor = (int)g_entries.size() - 1;
+        if (g_cursor < 0) g_cursor = 0;
+    }
+    enterAlarmEditor(slot);
 }
 
 static void searchRunQuery() {
@@ -2354,8 +2509,24 @@ static uint32_t g_settings_press_ms = 0;
 static uint32_t g_settings_last_ms  = 0;
 static char     g_settings_repeat_key = 0;
 
+static void moveAlarmsCursor(int delta);
+static void adjustAlarmsRow(int delta);
+static void moveAlarmEditorCursor(int delta);
+static void adjustAlarmEditorRow(int delta);
+static void activateAlarmEditorRow();
+static void enterAlarmEditor(int slot);
+static void moveDaysEditorCursor(int delta);
+static void activateDaysEditorRow();
+static void exitDaysEditor();
+static void enterSetTime();
+static void exitSetTime();
+static void moveSetTimeCursor(int delta);
+static void adjustSetTimeRow(int delta);
+static void activateSetTimeRow();
+
 static void pollSettingsKeys() {
-    if (!g_show_settings) {
+    if (!g_show_settings && !g_show_alarms && !g_show_alarm_editor
+        && !g_show_days_editor && !g_show_set_time) {
         g_settings_press_ms  = 0;
         g_settings_repeat_key = 0;
         return;
@@ -2380,10 +2551,34 @@ static void pollSettingsKeys() {
     }
     uint32_t now = millis();
     auto fire = [&]() {
-        if      (active == ';') moveSettingsCursor(-1);
-        else if (active == '.') moveSettingsCursor(+1);
-        else if (active == ',') adjustSettingsRow(-1);
-        else if (active == '/') adjustSettingsRow(+1);
+        if (g_show_set_time) {
+            if      (active == ';') moveSetTimeCursor(-1);
+            else if (active == '.') moveSetTimeCursor(+1);
+            else if (active == ',') adjustSetTimeRow(-1);
+            else if (active == '/') adjustSetTimeRow(+1);
+            return;
+        }
+        if (g_show_days_editor) {
+            // Only the cursor repeats; auto-repeating a day toggle would
+            // flip-flop the bit.
+            if      (active == ';') moveDaysEditorCursor(-1);
+            else if (active == '.') moveDaysEditorCursor(+1);
+        } else if (g_show_alarm_editor) {
+            if      (active == ';') moveAlarmEditorCursor(-1);
+            else if (active == '.') moveAlarmEditorCursor(+1);
+            else if (active == ',') adjustAlarmEditorRow(-1);
+            else if (active == '/') adjustAlarmEditorRow(+1);
+        } else if (g_show_alarms) {
+            if      (active == ';') moveAlarmsCursor(-1);
+            else if (active == '.') moveAlarmsCursor(+1);
+            else if (active == ',') adjustAlarmsRow(-1);
+            else if (active == '/') adjustAlarmsRow(+1);
+        } else {
+            if      (active == ';') moveSettingsCursor(-1);
+            else if (active == '.') moveSettingsCursor(+1);
+            else if (active == ',') adjustSettingsRow(-1);
+            else if (active == '/') adjustSettingsRow(+1);
+        }
     };
     if (g_settings_press_ms == 0) {
         // First poll seeing this key — the on-change dispatch has already
@@ -2709,7 +2904,7 @@ static void showResetModal();  // defined below
 enum SettingsRowId {
     SR_DIAG = 0, SR_WRAP, SR_HIDE_NA, SR_AUTO_NEXT, SR_AUTO_WAVE, SR_AUTO_SPEC,
     SR_FONT, SR_VOLMAX, SR_BRIGHT, SR_IDLE, SR_CHESS_LEVEL,
-    SR_KEY_REF, SR_REBUILD, SR_RESET,
+    SR_ALARMS, SR_KEY_REF, SR_REBUILD, SR_RESET,
     SR_COUNT
 };
 
@@ -2733,6 +2928,7 @@ static const SettingsRow SETTINGS_ROWS[SR_COUNT] = {
     {SRK_NUMERIC, "Brightness"},
     {SRK_NUMERIC, "Backlight off"},
     {SRK_NUMERIC, "Chess level"},
+    {SRK_ACTION,  "Alarms..."},
     {SRK_ACTION,  "Key reference"},
     {SRK_ACTION,  "Rebuild index"},
     {SRK_ACTION,  "Reset all"},
@@ -2868,9 +3064,7 @@ static void dismissSettings() {
 }
 
 static void moveSettingsCursor(int delta) {
-    int target = g_settings_cursor + delta;
-    if (target < 0) target = 0;
-    if (target >= SR_COUNT) target = SR_COUNT - 1;
+    int target = ((g_settings_cursor + delta) % SR_COUNT + SR_COUNT) % SR_COUNT;
     if (target == g_settings_cursor) return;
     g_settings_cursor = target;
     drawSettings();
@@ -2914,6 +3108,9 @@ static void activateSettingsRow() {
             case SR_REBUILD:
                 FuzzyIndex::startRebuild();
                 drawSettings();
+                break;
+            case SR_ALARMS:
+                enterAlarms();
                 break;
             case SR_RESET:
                 // Reset modal renders over the settings screen; on dismiss
@@ -3029,6 +3226,677 @@ static void dismissResetModal() {
     else                 draw();
 }
 
+// -- Alarms sub-menu -----------------------------------------------------
+// One row per "thing the user might want to touch":
+//   AR_SET_TIME            — opens the time/date editor (TODO: editor)
+//   AR_ALARM_0 .. AR_ALARM_4 — five slot rows; selecting one opens the
+//                            alarm editor (TODO: editor)
+//   AR_STANDBY             — standby brightness numeric (functional now)
+//   AR_BACK                — explicit return to Settings
+enum AlarmsRowId {
+    AR_SET_TIME = 0,
+    AR_ALARM_0, AR_ALARM_1, AR_ALARM_2, AR_ALARM_3, AR_ALARM_4,
+    AR_STANDBY, AR_BACK,
+    AR_COUNT
+};
+
+static const char DOW_LETTERS[7] = { 'M','T','W','T','F','S','S' };
+
+// "MTWTFSS" with an underscore for each off day — the day-set summary shared
+// by the Alarms list and the alarm editor's Days row.
+static void formatDaysMask(uint8_t days, char buf[8]) {
+    for (int i = 0; i < 7; ++i) buf[i] = (days & (1 << i)) ? DOW_LETTERS[i] : '_';
+    buf[7] = '\0';
+}
+
+static void alarmsRowLabel(int row, char* buf, size_t buflen) {
+    switch (row) {
+        case AR_SET_TIME: snprintf(buf, buflen, "Set current time"); return;
+        case AR_STANDBY:  snprintf(buf, buflen, "Clock brightness"); return;
+        case AR_BACK:     snprintf(buf, buflen, "Back"); return;
+        default: {
+            int slot = row - AR_ALARM_0;
+            const Alarm& a = g_alarms[slot];
+            char days[8];
+            formatDaysMask(a.days, days);
+            snprintf(buf, buflen, "%02u:%02u %s", a.hour, a.minute, days);
+            return;
+        }
+    }
+}
+
+static void alarmsRowValueStr(int row, char* buf, size_t buflen) {
+    switch (row) {
+        case AR_SET_TIME: snprintf(buf, buflen, ">"); return;
+        case AR_STANDBY:  snprintf(buf, buflen, "%d", standbyBrightness()); return;
+        case AR_BACK:     snprintf(buf, buflen, ""); return;
+        default:          snprintf(buf, buflen, ">"); return;
+    }
+}
+
+static void drawAlarms() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setFont(notchFont());
+    d.setTextSize(notchSize());
+    d.setTextWrap(false, false);
+    int rh = rowH();
+    int cw = charW();
+    int n_vis = SCREEN_H / rh;
+    if (n_vis < 1) n_vis = 1;
+    int rows_avail = n_vis - 1;
+    if (rows_avail < 1) rows_avail = 1;
+
+    static int s_top = 0;
+    if (g_alarms_cursor < s_top) s_top = g_alarms_cursor;
+    if (g_alarms_cursor >= s_top + rows_avail) s_top = g_alarms_cursor - rows_avail + 1;
+    if (s_top + rows_avail > AR_COUNT) s_top = AR_COUNT - rows_avail;
+    if (s_top < 0) s_top = 0;
+
+    // Title strip.
+    d.setTextColor(COL_HEADER_TXT, BLACK);
+    d.setCursor(2, 0);
+    d.print("Alarms");
+
+    for (int i = 0; i < rows_avail && (s_top + i) < AR_COUNT; ++i) {
+        int row = s_top + i;
+        int y = rh + i * rh;
+        bool selected = (row == g_alarms_cursor);
+        bool armed_slot = (row >= AR_ALARM_0 && row <= AR_ALARM_4)
+                          && g_alarms[row - AR_ALARM_0].enabled;
+        uint16_t fg;
+        if (row >= AR_ALARM_0 && row <= AR_ALARM_4) {
+            // Slot rows colour-code by armed state — pink-magenta when
+            // enabled (distinct from yellow selection bar and the cyan used
+            // for directories elsewhere), mid-grey when off. The same text
+            // colour is used selected or not, so the active/inactive signal
+            // survives the highlight.
+            fg = armed_slot ? 0xFA1F : COL_HEADER_TXT;
+        } else {
+            fg = COL_FILE_BRIGHT;
+        }
+        if (selected) {
+            d.fillRect(0, y, SCREEN_W, rh, COL_SETTINGS_SEL_BG);
+            // Inactive slot text in mid-grey washes out against the yellow
+            // selection bar; use black for selected+inactive so the contrast
+            // holds. Active slots keep their pink text (already high-contrast
+            // against yellow).
+            uint16_t sel_fg = (row >= AR_ALARM_0 && row <= AR_ALARM_4 && !armed_slot)
+                              ? 0x0000 : fg;
+            d.setTextColor(sel_fg, COL_SETTINGS_SEL_BG);
+        } else {
+            d.setTextColor(fg, BLACK);
+        }
+        char name[24];
+        alarmsRowLabel(row, name, sizeof(name));
+        d.setCursor(2, y);
+        d.print(name);
+        char val[12];
+        alarmsRowValueStr(row, val, sizeof(val));
+        int vw = (int)strlen(val) * cw;
+        d.setCursor(SCREEN_W - vw - 2, y);
+        d.print(val);
+    }
+    presentFrame();
+}
+
+static void enterAlarms() {
+    g_show_alarms = true;
+    g_alarms_cursor = 0;
+    drawAlarms();
+}
+
+static void exitAlarms() {
+    g_show_alarms = false;
+    if (g_show_settings) drawSettings(); else draw();
+}
+
+static void moveAlarmsCursor(int delta) {
+    int n = ((g_alarms_cursor + delta) % AR_COUNT + AR_COUNT) % AR_COUNT;
+    if (n == g_alarms_cursor) return;
+    g_alarms_cursor = n;
+    drawAlarms();
+}
+
+static void activateAlarmsRow() {
+    int row = g_alarms_cursor;
+    if (row == AR_BACK) { exitAlarms(); return; }
+    if (row == AR_SET_TIME) {
+        enterSetTime();
+        return;
+    }
+    if (row >= AR_ALARM_0 && row <= AR_ALARM_4) {
+        enterAlarmEditor(row - AR_ALARM_0);
+        return;
+    }
+    // AR_STANDBY is numeric; enter is a no-op.
+}
+
+static void adjustAlarmsRow(int delta) {
+    int row = g_alarms_cursor;
+    if (row == AR_STANDBY) {
+        int n = g_standby_brightness_idx + delta;
+        if (n < 0) n = 0;
+        if (n > STANDBY_BRIGHTNESS_MAX_IDX) n = STANDBY_BRIGHTNESS_MAX_IDX;
+        if (n == g_standby_brightness_idx) return;
+        g_standby_brightness_idx = n;
+        markStateDirty();
+        drawAlarms();
+        return;
+    }
+    if (delta > 0) activateAlarmsRow();  // `/` activates action rows
+}
+
+// -- Alarm editor --------------------------------------------------------
+// One row per editable field. Days are seven independent toggle rows so
+// the user never wonders how to flip just one — same pattern as every
+// other toggle in Settings.
+enum AlarmEditorRowId {
+    AE_ENABLED = 0,
+    AE_HOUR, AE_MIN,
+    AE_DAYS,
+    AE_VOL, AE_RAMP,
+    AE_TRACK,
+    AE_PREVIEW, AE_BACK,
+    AE_COUNT
+};
+
+static void enterAlarmEditor(int slot);
+static void exitAlarmEditor();
+static void drawAlarmEditor();
+static void enterDaysEditor();
+static void navigateToPickTarget(const std::string& track);
+
+static void aeRowLabel(int row, char* buf, size_t buflen) {
+    const Alarm& a = g_alarms[g_alarm_editor_slot];
+    switch (row) {
+        case AE_HOUR:    snprintf(buf, buflen, "Hour"); return;
+        case AE_MIN:     snprintf(buf, buflen, "Minute"); return;
+        case AE_DAYS:    snprintf(buf, buflen, "Days"); return;
+        case AE_TRACK:   snprintf(buf, buflen, "Track"); return;
+        case AE_VOL:     snprintf(buf, buflen, "Volume"); return;
+        case AE_RAMP:    snprintf(buf, buflen, "Ramp (s)"); return;
+        case AE_ENABLED: snprintf(buf, buflen, "Enabled"); return;
+        case AE_PREVIEW: snprintf(buf, buflen, "Preview"); return;
+        case AE_BACK:    snprintf(buf, buflen, "Back"); return;
+    }
+    (void)a;
+}
+
+static void aeRowValueStr(int row, char* buf, size_t buflen) {
+    const Alarm& a = g_alarms[g_alarm_editor_slot];
+    switch (row) {
+        case AE_HOUR:    snprintf(buf, buflen, "%02u", a.hour); return;
+        case AE_MIN:     snprintf(buf, buflen, "%02u", a.minute); return;
+        case AE_DAYS: {
+            char days[8];
+            formatDaysMask(a.days, days);
+            snprintf(buf, buflen, "%s", days);
+            return;
+        }
+        case AE_TRACK: {
+            if (a.track.empty()) { snprintf(buf, buflen, "(beep)"); return; }
+            const char* slash = strrchr(a.track.c_str(), '/');
+            snprintf(buf, buflen, "%s", slash ? slash + 1 : a.track.c_str());
+            return;
+        }
+        case AE_VOL:     snprintf(buf, buflen, "%u", a.volume); return;
+        case AE_RAMP:    snprintf(buf, buflen, "%u", a.ramp_s); return;
+        case AE_ENABLED: snprintf(buf, buflen, "[%c]", a.enabled ? 'x' : ' '); return;
+        case AE_PREVIEW: snprintf(buf, buflen, ">"); return;
+        case AE_BACK:    buf[0] = '\0'; return;
+    }
+}
+
+static constexpr int AE_TRACK_MAX_LINES = 3;  // wrapped name lines under "Track:"
+
+// Wraps the track basename into up to AE_TRACK_MAX_LINES indented lines for
+// the editor's multi-line Track display; the last line gets a trailing "..."
+// when the name overruns. Returns the number of lines filled.
+static int trackWrapLines(const std::string& track, int cw, char lines[][64]) {
+    const char* slash = strrchr(track.c_str(), '/');
+    const char* base  = slash ? slash + 1 : track.c_str();
+    int per = (SCREEN_W - cw - 2) / cw;   // one-char indent on the left
+    if (per < 1) per = 1;
+    int len = (int)strlen(base);
+    int n = 0, off = 0;
+    while (off < len && n < AE_TRACK_MAX_LINES) {
+        int remaining = len - off;
+        bool last_line = (n == AE_TRACK_MAX_LINES - 1);
+        if (last_line && remaining > per) {
+            int keep = (per > 3) ? per - 3 : per;
+            snprintf(lines[n], 64, "%.*s...", keep, base + off);
+            off = len;
+        } else {
+            int chunk = std::min(per, remaining);
+            snprintf(lines[n], 64, "%.*s", chunk, base + off);
+            off += chunk;
+        }
+        ++n;
+    }
+    return n;
+}
+
+// Editor rows are one line tall except the Track row, which expands to show
+// the wrapped track name beneath its "Track:" label line.
+static int aeRowLines(int row) {
+    if (row != AE_TRACK) return 1;
+    const std::string& t = g_alarms[g_alarm_editor_slot].track;
+    if (t.empty()) return 1;  // "(beep)" sits on the label line
+    char lines[AE_TRACK_MAX_LINES][64];
+    return 1 + trackWrapLines(t, charW(), lines);
+}
+
+// Advance the scroll top until the selected row's label line is on-screen,
+// accounting for the Track row's variable height (mirrors the browser's
+// ensureCursorVisible, which the uniform-row scroll math couldn't).
+static void ensureAeCursorVisible() {
+    int rh = rowH();
+    int avail = SCREEN_H - rh;  // the title occupies the first row
+    if (g_alarm_editor_cursor < g_alarm_editor_top) {
+        g_alarm_editor_top = g_alarm_editor_cursor;
+        return;
+    }
+    while (g_alarm_editor_top < g_alarm_editor_cursor) {
+        int y = 0;
+        for (int row = g_alarm_editor_top; row < g_alarm_editor_cursor; ++row)
+            y += aeRowLines(row) * rh;
+        if (y + rh <= avail) return;
+        ++g_alarm_editor_top;
+    }
+}
+
+static void drawAlarmEditor() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setFont(notchFont());
+    d.setTextSize(notchSize());
+    d.setTextWrap(false, false);
+    int rh = rowH();
+    int cw = charW();
+
+    ensureAeCursorVisible();
+
+    d.setTextColor(COL_HEADER_TXT, BLACK);
+    d.setCursor(2, 0);
+    char title[16];
+    snprintf(title, sizeof(title), "Alarm %d", g_alarm_editor_slot + 1);
+    d.print(title);
+
+    const std::string& track = g_alarms[g_alarm_editor_slot].track;
+    int y = rh;
+    for (int row = g_alarm_editor_top; row < AE_COUNT && y + rh <= SCREEN_H; ++row) {
+        bool selected = (row == g_alarm_editor_cursor);
+        if (selected) {
+            d.fillRect(0, y, SCREEN_W, rh, COL_SETTINGS_SEL_BG);
+            d.setTextColor(0x0000, COL_SETTINGS_SEL_BG);
+        } else {
+            d.setTextColor(COL_FILE_BRIGHT, BLACK);
+        }
+        char name[24]; aeRowLabel(row, name, sizeof(name));
+        d.setCursor(2, y);
+        d.print(name);
+        if (row == AE_TRACK && !track.empty()) {
+            // ">" marks the row actionable; the full name wraps below it,
+            // dimmed and indented, so a long name reads in full.
+            d.setCursor(SCREEN_W - cw - 2, y);
+            d.print(">");
+            char lines[AE_TRACK_MAX_LINES][64];
+            int nl = trackWrapLines(track, cw, lines);
+            d.setTextColor(COL_HEADER_TXT, BLACK);
+            for (int li = 0; li < nl; ++li) {
+                d.setCursor(2 + cw, y + (li + 1) * rh);
+                d.print(lines[li]);
+            }
+            y += (1 + nl) * rh;
+        } else {
+            char val[24]; aeRowValueStr(row, val, sizeof(val));
+            int vw = (int)strlen(val) * cw;
+            d.setCursor(SCREEN_W - vw - 2, y);
+            d.print(val);
+            y += rh;
+        }
+    }
+    presentFrame();
+}
+
+static void moveAlarmEditorCursor(int delta) {
+    int n = ((g_alarm_editor_cursor + delta) % AE_COUNT + AE_COUNT) % AE_COUNT;
+    if (n == g_alarm_editor_cursor) return;
+    g_alarm_editor_cursor = n;
+    drawAlarmEditor();
+}
+
+static void enterAlarmEditor(int slot) {
+    g_alarm_editor_slot = slot;
+    g_alarm_editor_cursor = 0;
+    g_alarm_editor_top = 0;
+    g_show_alarm_editor = true;
+    drawAlarmEditor();
+}
+
+static void exitAlarmEditor() {
+    g_show_alarm_editor = false;
+    if (g_show_alarms) drawAlarms(); else draw();
+}
+
+static void adjustAlarmEditorRow(int delta) {
+    Alarm& a = g_alarms[g_alarm_editor_slot];
+    int row = g_alarm_editor_cursor;
+    switch (row) {
+        case AE_HOUR:    a.hour    = (a.hour    + 24 + delta) % 24;  markStateDirty(); break;
+        case AE_MIN:     a.minute  = (a.minute  + 60 + delta) % 60;  markStateDirty(); break;
+        case AE_VOL: {
+            int n = (int)a.volume + delta;
+            if (n < 0) n = 0;
+            if (n > g_volume_max) n = g_volume_max;
+            a.volume = (uint8_t)n;
+            markStateDirty();
+            break;
+        }
+        case AE_RAMP: {
+            int n = (int)a.ramp_s + delta;
+            if (n < 0) n = 0;
+            if (n > 60) n = 60;
+            a.ramp_s = (uint8_t)n;
+            markStateDirty();
+            break;
+        }
+        case AE_ENABLED:
+            a.enabled = (delta > 0);
+            markStateDirty();
+            break;
+        case AE_TRACK:
+            // `/` (delta > 0) opens the picker via activateAlarmEditorRow;
+            // `,` (delta < 0) clears the track back to the built-in beep —
+            // there's no other value to scroll, so left means "no track".
+            if (delta < 0 && !a.track.empty()) {
+                a.track.clear();
+                markStateDirty();
+                break;
+            }
+            return;
+        default:
+            // Action rows (Days, Track, Preview, Back) are reached through
+            // activateAlarmEditorRow on `/`, not here.
+            return;
+    }
+    drawAlarmEditor();
+}
+
+static void activateAlarmEditorRow() {
+    int row = g_alarm_editor_cursor;
+    if (row == AE_BACK)    { exitAlarmEditor(); return; }
+    if (row == AE_ENABLED) {
+        Alarm& a = g_alarms[g_alarm_editor_slot];
+        a.enabled = !a.enabled;
+        markStateDirty();
+        drawAlarmEditor();
+        return;
+    }
+    if (row == AE_DAYS) {
+        enterDaysEditor();
+        return;
+    }
+    if (row == AE_TRACK) {
+        g_pick_slot = g_alarm_editor_slot;
+        g_pick_saved_path   = g_cur_path;
+        g_pick_saved_cursor = g_cursor;
+        g_show_alarm_editor = false;
+        g_show_alarms       = false;
+        g_show_settings     = false;
+        // Open the picker on the slot's current track (folder navigated, file
+        // highlighted) so editing an existing alarm starts in context; an
+        // empty slot or a vanished folder falls back to the last position.
+        navigateToPickTarget(g_alarms[g_alarm_editor_slot].track);
+        draw();
+        return;
+    }
+    if (row == AE_PREVIEW) {
+        // Arm a fire of this slot in 5 s. We dim to clock brightness and
+        // show the clock so the user sees the same wake framing they would
+        // for a real fire; any key in that 5 s window cancels.
+        g_alarm_preview_slot       = g_alarm_editor_slot;
+        g_alarm_preview_fire_at_ms = millis() + 5000;
+        g_show_alarm_editor = false;
+        g_show_alarms       = false;
+        g_show_settings     = false;
+        enterStandby();
+        return;
+    }
+}
+
+// Point the browser at the folder holding `track`, with that file under the
+// cursor. No-op (keeps the last browser position) when there's no track or
+// the folder is gone — e.g. the SD card was swapped or the file moved.
+static void navigateToPickTarget(const std::string& track) {
+    if (track.empty()) return;
+    std::string dir = parentPath(track);
+    if (dir.empty() || !SD.exists(dir.c_str())) return;
+    loadDir(dir);
+    std::string name = basename(track);
+    for (int i = 0; i < (int)g_entries.size(); ++i) {
+        if (g_entries[i].name == name) { g_cursor = i; break; }
+    }
+}
+
+// -- Days editor (toggle which days an alarm fires; nested under the alarm
+// editor, reached from its single "Days" row) ---------------------------
+enum DaysEditorRowId { DE_MON = 0, DE_TUE, DE_WED, DE_THU, DE_FRI, DE_SAT, DE_SUN,
+                       DE_BACK, DE_COUNT };
+
+static const char* const DOW_NAMES[7] = {
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+};
+
+static void drawDaysEditor() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setFont(notchFont());
+    d.setTextSize(notchSize());
+    d.setTextWrap(false, false);
+    int rh = rowH();
+    int cw = charW();
+    const Alarm& a = g_alarms[g_alarm_editor_slot];
+
+    int rows_avail = (SCREEN_H / rh) - 1;
+    if (rows_avail < 1) rows_avail = 1;
+    static int de_top = 0;
+    if (g_days_editor_cursor < de_top) de_top = g_days_editor_cursor;
+    if (g_days_editor_cursor >= de_top + rows_avail) de_top = g_days_editor_cursor - rows_avail + 1;
+    if (de_top + rows_avail > DE_COUNT) de_top = DE_COUNT - rows_avail;
+    if (de_top < 0) de_top = 0;
+
+    d.setTextColor(COL_HEADER_TXT, BLACK);
+    d.setCursor(2, 0);
+    d.print("Days");
+
+    for (int i = 0; i < rows_avail && (de_top + i) < DE_COUNT; ++i) {
+        int row = de_top + i;
+        int y = rh + i * rh;
+        bool selected = (row == g_days_editor_cursor);
+        if (selected) {
+            d.fillRect(0, y, SCREEN_W, rh, COL_SETTINGS_SEL_BG);
+            d.setTextColor(0x0000, COL_SETTINGS_SEL_BG);
+        } else {
+            d.setTextColor(COL_FILE_BRIGHT, BLACK);
+        }
+        d.setCursor(2, y);
+        if (row == DE_BACK) {
+            d.print("Back");
+        } else {
+            d.print(DOW_NAMES[row]);
+            char val[4];
+            snprintf(val, sizeof(val), "[%c]", (a.days & (1 << row)) ? 'x' : ' ');
+            int vw = (int)strlen(val) * cw;
+            d.setCursor(SCREEN_W - vw - 2, y);
+            d.print(val);
+        }
+    }
+    presentFrame();
+}
+
+static void enterDaysEditor() {
+    g_days_editor_cursor = 0;
+    g_show_days_editor = true;
+    drawDaysEditor();
+}
+
+static void exitDaysEditor() {
+    g_show_days_editor = false;
+    drawAlarmEditor();
+}
+
+static void moveDaysEditorCursor(int delta) {
+    int n = ((g_days_editor_cursor + delta) % DE_COUNT + DE_COUNT) % DE_COUNT;
+    if (n == g_days_editor_cursor) return;
+    g_days_editor_cursor = n;
+    drawDaysEditor();
+}
+
+static void activateDaysEditorRow() {
+    if (g_days_editor_cursor == DE_BACK) { exitDaysEditor(); return; }
+    g_alarms[g_alarm_editor_slot].days ^= (1 << g_days_editor_cursor);
+    markStateDirty();
+    drawDaysEditor();
+}
+
+// -- Set Current Time editor --------------------------------------------
+enum SctRowId { SCT_HOUR = 0, SCT_MIN, SCT_YEAR, SCT_MONTH, SCT_DAY,
+                SCT_COMMIT, SCT_BACK, SCT_COUNT };
+
+static int daysInMonth(uint16_t y, uint8_t m) {
+    static const uint8_t days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (m < 1 || m > 12) return 31;
+    if (m == 2) {
+        bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+        return leap ? 29 : 28;
+    }
+    return days[m - 1];
+}
+
+static void sctRowLabel(int row, char* buf, size_t buflen) {
+    switch (row) {
+        case SCT_HOUR:   snprintf(buf, buflen, "Hour"); return;
+        case SCT_MIN:    snprintf(buf, buflen, "Minute"); return;
+        case SCT_YEAR:   snprintf(buf, buflen, "Year"); return;
+        case SCT_MONTH:  snprintf(buf, buflen, "Month"); return;
+        case SCT_DAY:    snprintf(buf, buflen, "Day"); return;
+        case SCT_COMMIT: snprintf(buf, buflen, "Commit"); return;
+        case SCT_BACK:   snprintf(buf, buflen, "Back"); return;
+    }
+}
+
+static void sctRowValueStr(int row, char* buf, size_t buflen) {
+    switch (row) {
+        case SCT_HOUR:   snprintf(buf, buflen, "%02u", g_sct_hour); return;
+        case SCT_MIN:    snprintf(buf, buflen, "%02u", g_sct_min); return;
+        case SCT_YEAR:   snprintf(buf, buflen, "%04u", g_sct_year); return;
+        case SCT_MONTH:  snprintf(buf, buflen, "%02u", g_sct_month); return;
+        case SCT_DAY:    snprintf(buf, buflen, "%02u", g_sct_day); return;
+        case SCT_COMMIT:
+        case SCT_BACK:   buf[0] = '\0'; return;
+    }
+}
+
+static void drawSetTime() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setFont(notchFont());
+    d.setTextSize(notchSize());
+    d.setTextWrap(false, false);
+    int rh = rowH();
+    int cw = charW();
+    d.setTextColor(COL_HEADER_TXT, BLACK);
+    d.setCursor(2, 0);
+    d.print("Set current time");
+    for (int row = 0; row < SCT_COUNT; ++row) {
+        int y = rh + row * rh;
+        bool selected = (row == g_sct_cursor);
+        if (selected) {
+            d.fillRect(0, y, SCREEN_W, rh, COL_SETTINGS_SEL_BG);
+            d.setTextColor(0x0000, COL_SETTINGS_SEL_BG);
+        } else {
+            d.setTextColor(COL_FILE_BRIGHT, BLACK);
+        }
+        char name[24]; sctRowLabel(row, name, sizeof(name));
+        char val[12];  sctRowValueStr(row, val, sizeof(val));
+        d.setCursor(2, y);
+        d.print(name);
+        int vw = (int)strlen(val) * cw;
+        d.setCursor(SCREEN_W - vw - 2, y);
+        d.print(val);
+    }
+    presentFrame();
+}
+
+static void enterSetTime() {
+    // Seed the draft from the live RTC so the user adjusts deltas, not types.
+    rtc_date_type d; g_rtc.getDate(&d);
+    rtc_time_type t; g_rtc.getTime(&t);
+    g_sct_year  = d.Year;
+    g_sct_month = d.Month;
+    g_sct_day   = d.Date;
+    g_sct_hour  = t.Hours;
+    g_sct_min   = t.Minutes;
+    g_sct_cursor = 0;
+    g_show_set_time = true;
+    drawSetTime();
+}
+
+static void exitSetTime() {
+    g_show_set_time = false;
+    if (g_show_alarms) drawAlarms(); else draw();
+}
+
+static void commitSetTime() {
+    // Clamp day to the new month/year before writing.
+    int dim = daysInMonth(g_sct_year, g_sct_month);
+    if (g_sct_day > dim) g_sct_day = dim;
+    rtc_date_type d;
+    d.Year    = g_sct_year;
+    d.Month   = g_sct_month;
+    d.Date    = g_sct_day;
+    d.WeekDay = dayOfWeekMonFirst(g_sct_year, g_sct_month, g_sct_day);
+    g_rtc.setDate(&d);
+    rtc_time_type t;
+    t.Hours   = g_sct_hour;
+    t.Minutes = g_sct_min;
+    t.Seconds = 0;
+    g_rtc.setTime(&t);
+    exitSetTime();
+}
+
+static void moveSetTimeCursor(int delta) {
+    int n = ((g_sct_cursor + delta) % SCT_COUNT + SCT_COUNT) % SCT_COUNT;
+    if (n == g_sct_cursor) return;
+    g_sct_cursor = n;
+    drawSetTime();
+}
+
+static void adjustSetTimeRow(int delta) {
+    auto mod = [](int v, int hi) { return ((v % hi) + hi) % hi; };
+    switch (g_sct_cursor) {
+        case SCT_HOUR:  g_sct_hour  = (uint8_t)mod(g_sct_hour  + delta, 24); break;
+        case SCT_MIN:   g_sct_min   = (uint8_t)mod(g_sct_min   + delta, 60); break;
+        case SCT_YEAR:  g_sct_year  = (uint16_t)(g_sct_year + delta); break;
+        case SCT_MONTH: g_sct_month = (uint8_t)(1 + mod(g_sct_month - 1 + delta, 12)); break;
+        case SCT_DAY: {
+            int dim = daysInMonth(g_sct_year, g_sct_month);
+            g_sct_day = (uint8_t)(1 + mod(g_sct_day - 1 + delta, dim));
+            break;
+        }
+        case SCT_COMMIT: if (delta > 0) commitSetTime(); return;
+        case SCT_BACK:   if (delta > 0) exitSetTime();  return;
+    }
+    drawSetTime();
+}
+
+static void activateSetTimeRow() {
+    if (g_sct_cursor == SCT_COMMIT) { commitSetTime(); return; }
+    if (g_sct_cursor == SCT_BACK)   { exitSetTime();  return; }
+}
+
 static void enterBatteryLowState() {
     stopPlayback();
 
@@ -3054,7 +3922,16 @@ static void enterBatteryLowState() {
     M5.Power.powerOff();
 }
 
-static Unit_RTC g_rtc;
+// Zeller's congruence — returns Mon=0..Sun=6 for Gregorian (y,m,d).
+static uint8_t dayOfWeekMonFirst(uint16_t y, uint8_t m, uint8_t d) {
+    if (m < 3) { m += 12; y -= 1; }
+    uint16_t K = y % 100;
+    uint16_t J = y / 100;
+    int h = (d + (13 * (m + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+    // Zeller h: 0=Sat..6=Fri. Convert to Mon=0..Sun=6.
+    static const uint8_t to_mon_first[7] = { 5, 6, 0, 1, 2, 3, 4 };
+    return to_mon_first[h];
+}
 
 static bool parseCompileDateTime(rtc_date_type& d, rtc_time_type& t) {
     static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
@@ -3064,7 +3941,7 @@ static bool parseCompileDateTime(rtc_date_type& d, rtc_time_type& t) {
     d.Month   = ((ms - months) / 3) + 1;
     d.Date    = atoi(__DATE__ + 4);             // day (space-padded ok)
     d.Year    = atoi(__DATE__ + 7);
-    d.WeekDay = 0;                              // unknown without calendar math
+    d.WeekDay = dayOfWeekMonFirst(d.Year, d.Month, d.Date);
     t.Hours   = atoi(__TIME__ + 0);             // __TIME__: "HH:MM:SS"
     t.Minutes = atoi(__TIME__ + 3);
     t.Seconds = atoi(__TIME__ + 6);
@@ -3091,6 +3968,7 @@ static void pollRtcClock() {
     g_rtc.getTime(&t);
     snprintf(g_diag_clk, sizeof(g_diag_clk), "%02u:%02u:%02u",
              t.Hours, t.Minutes, t.Seconds);
+    if (fullScreenClockActive()) drawClockScreen();
 }
 
 static void setupRtc() {
@@ -3100,6 +3978,406 @@ static void setupRtc() {
     Wire.begin(/*sda=*/2, /*scl=*/1, /*freq=*/100000);
     g_rtc.begin(&Wire);
     seedRtcIfUnset();
+}
+
+// -- Standby clock screen ------------------------------------------------
+static constexpr const char* WEEKDAY_NAMES[7] = { "Mon","Tue","Wed","Thu","Fri","Sat","Sun" };
+static uint32_t g_snooze_until_ms = 0;   // 0 = not snoozing
+static uint32_t g_standby_entered_ms = 0;
+
+// Alarm fire state. `g_alarm_fire_slot` is the slot that armed; the
+// `active_ms` counter accumulates only while playing (snooze paused).
+static int      g_alarm_fire_slot     = -1;
+static uint32_t g_alarm_active_start  = 0;     // millis when current play interval started
+static uint32_t g_alarm_active_total  = 0;     // cumulative play time across snoozes
+static uint32_t g_alarm_beep_last_ms  = 0;
+static bool     g_alarm_beep_on       = false;
+static uint8_t  g_alarm_prior_brightness_idx = 0;
+// Pre-alarm playback snapshot, taken on a fresh fire and restored on dismiss
+// so the alarm puts the user back where they were. Volume is always restored;
+// the track (paused/playing at its byte position) only when one was playing.
+static int         g_alarm_prior_volume = 0;
+static std::string g_alarm_prior_track;
+static uint32_t    g_alarm_prior_pos    = 0;
+static bool        g_alarm_prior_paused = false;
+static bool        g_alarm_prior_playing = false;  // a track was loaded pre-alarm
+// Volume ramp: linear from 0 → configured over ramp_s seconds. Once the
+// user presses +/- mid-fire, `ramp_overridden` latches and the auto-ramp
+// stops touching the volume.
+static bool     g_alarm_ramp_overridden = false;
+// Set when the slot's configured track can't be opened (no track, SD missing,
+// file gone, unsupported) — the fire falls back to the built-in beep even
+// though the slot may carry a non-empty track path.
+static bool     g_alarm_beep_fallback   = false;
+// (Preview globals — g_alarm_preview_fire_at_ms / g_alarm_preview_slot —
+// are forward-declared near the alarm editor globals above; preview firing
+// is driven from pollAlarms below.)
+// Per-slot watermark (today's yyyymmddhhmm) so an alarm only fires once
+// per matching minute. RAM-only; a cold boot within the fire minute will
+// re-fire (accepted risk, per Approach).
+static uint32_t g_alarm_last_fire_key[ALARM_COUNT] = { 0 };
+
+// Weekday + time of the next armed alarm relative to now (e.g. "Sun 08:30"),
+// scanning the coming week. Empty string if no alarm is armed. The "next:"
+// label is added by the caller so it can sit on its own line.
+static std::string nextAlarmString() {
+    rtc_date_type d; g_rtc.getDate(&d);
+    rtc_time_type t; g_rtc.getTime(&t);
+    uint8_t today_dow = dayOfWeekMonFirst(d.Year, d.Month, d.Date);
+    int now_min = t.Hours * 60 + t.Minutes;
+    int best_offset_min = INT_MAX;
+    int best_dow = -1;
+    int best_hm  = 0;
+    for (int dow_offset = 0; dow_offset < 7; ++dow_offset) {
+        uint8_t dow = (today_dow + dow_offset) % 7;
+        for (int i = 0; i < ALARM_COUNT; ++i) {
+            const Alarm& a = g_alarms[i];
+            if (!a.enabled) continue;
+            if (!(a.days & (1 << dow))) continue;
+            int alarm_min = a.hour * 60 + a.minute;
+            int offset = dow_offset * 24 * 60 + (alarm_min - now_min);
+            if (dow_offset == 0 && alarm_min <= now_min) offset += 7 * 24 * 60;
+            if (offset < best_offset_min) {
+                best_offset_min = offset;
+                best_dow = dow;
+                best_hm  = alarm_min;
+            }
+        }
+    }
+    if (best_dow < 0) return {};
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%s %02d:%02d",
+             WEEKDAY_NAMES[best_dow], best_hm / 60, best_hm % 60);
+    return buf;
+}
+
+// Full-screen 24-hr clock used by standby and alarm-firing modes.
+// Draw `text` centred at `size` starting at `top`, wrapping onto a second
+// line (split at the most central space) when it's too wide for one line.
+static void drawClockSubtext(const char* text, int top, int size, uint16_t col) {
+    auto& d = g_canvas;
+    d.setTextSize(size);
+    d.setTextColor(col, BLACK);
+    int cw  = 6 * size;
+    int chh = 8 * size;
+    int len = (int)strlen(text);
+    if (len * cw <= SCREEN_W - 4) {
+        d.setCursor((SCREEN_W - len * cw) / 2, top);
+        d.print(text);
+        return;
+    }
+    // Too wide: split at the space nearest the middle.
+    int mid = len / 2, brk = -1;
+    for (int off = 0; off <= mid && brk < 0; ++off) {
+        if (mid + off < len && text[mid + off] == ' ') brk = mid + off;
+        else if (text[mid - off] == ' ')               brk = mid - off;
+    }
+    if (brk < 0) brk = mid;  // no space — hard cut
+    char l1[40], l2[40];
+    snprintf(l1, sizeof(l1), "%.*s", brk, text);
+    snprintf(l2, sizeof(l2), "%s", text + brk + (text[brk] == ' ' ? 1 : 0));
+    d.setCursor((SCREEN_W - (int)strlen(l1) * cw) / 2, top);
+    d.print(l1);
+    d.setCursor((SCREEN_W - (int)strlen(l2) * cw) / 2, top + chh + 2);
+    d.print(l2);
+}
+
+static void drawClockScreen() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    rtc_date_type rd; g_rtc.getDate(&rd);
+    rtc_time_type rt; g_rtc.getTime(&rt);
+    uint8_t dow = dayOfWeekMonFirst(rd.Year, rd.Month, rd.Date);
+
+    // Warm, bright palette (high red + green, no blue): legible at low standby
+    // brightness so the user needn't raise the backlight, while keeping blue
+    // light minimal for night use.
+    constexpr uint16_t COL_CLOCK_PRIMARY   = 0xFEC0;  // bright amber — the time
+    constexpr uint16_t COL_CLOCK_SECONDARY = 0xFD40;  // amber — day / battery / hint
+    constexpr uint16_t COL_CLOCK_ALERT     = 0xFB00;  // deep orange — fire / snooze
+
+    // Status strip: today's weekday top-left and battery top-right, matched
+    // in colour and size so they read as a pair.
+    d.setTextSize(2);
+    d.setTextColor(COL_CLOCK_SECONDARY, BLACK);
+    d.setCursor(2, 2);
+    d.print(WEEKDAY_NAMES[dow]);
+    if (g_battery_level >= 0) {
+        char bat[10];
+        snprintf(bat, sizeof(bat), "bat %d%%", g_battery_level);
+        int bw = (int)strlen(bat) * 12;
+        d.setCursor(SCREEN_W - bw - 2, 2);
+        d.print(bat);
+    }
+
+    // Big HH:MM centred — size 7 → 42 px char width × 56 px tall.
+    char hhmm[6];
+    snprintf(hhmm, sizeof(hhmm), "%02u:%02u", rt.Hours, rt.Minutes);
+    d.setTextSize(7);
+    d.setTextColor(COL_CLOCK_PRIMARY, BLACK);
+    int big_w = (int)strlen(hhmm) * 42;
+    int big_h = 56;
+    // Standby/snooze drop the time a little lower so it sits balanced between
+    // the corner status text and the two-line next-alarm hint. Firing keeps it
+    // higher because its dismiss prompt needs the extra room below.
+    int big_y = g_alarm_firing ? 22 : 28;
+    d.setCursor((SCREEN_W - big_w) / 2, big_y);
+    d.print(hhmm);
+
+    int below_y = big_y + big_h + (g_alarm_firing ? 4 : 2);
+    if (g_alarm_firing) {
+        // Two mirrored "label: action" hints near the bottom. ` reads as Esc
+        // from the user's side, so it isn't spelled out separately.
+        d.setTextSize(2);
+        d.setTextColor(COL_CLOCK_ALERT, BLACK);
+        const char* dm = "Esc/Enter: dismiss";
+        d.setCursor((SCREEN_W - (int)strlen(dm) * 12) / 2, SCREEN_H - 38);
+        d.print(dm);
+        d.setTextColor(COL_CLOCK_SECONDARY, BLACK);
+        const char* snz = "other key: snooze";
+        d.setCursor((SCREEN_W - (int)strlen(snz) * 12) / 2, SCREEN_H - 18);
+        d.print(snz);
+    } else if (g_alarm_snoozing) {
+        uint32_t now = millis();
+        uint32_t remain = (g_snooze_until_ms > now) ? (g_snooze_until_ms - now) : 0;
+        int rs = (int)(remain / 1000);
+        char snz[20];
+        snprintf(snz, sizeof(snz), "Snooze %d:%02d", rs / 60, rs % 60);
+        drawClockSubtext(snz, below_y, 3, COL_CLOCK_ALERT);  // alarm still pending
+    } else {
+        // Next-alarm hint: "next:" label on its own line, the alarm's weekday
+        // and time on the line below.
+        std::string detail = nextAlarmString();
+        if (!detail.empty()) {
+            drawClockSubtext("next:", below_y, 3, COL_CLOCK_SECONDARY);
+            drawClockSubtext(detail.c_str(), below_y + 24, 3, COL_CLOCK_SECONDARY);
+        }
+    }
+    presentFrame();
+}
+
+static void enterStandby() {
+    if (g_standby_active) return;
+    g_standby_active = true;
+    g_standby_entered_ms = millis();
+    // Short ramp (1 s) — long enough to hide the redraw-vs-PWM-step beat
+    // that reads as a flash, short enough that the linear-in-PWM ramp
+    // doesn't visibly bunch all the change into the tail.
+    setBrightnessRampTo(standbyBrightness(), 1000);
+    drawClockScreen();
+}
+
+static void exitStandby() {
+    if (!g_standby_active) return;
+    g_standby_active = false;
+    // Cancel any pending preview — the user actively exited.
+    g_alarm_preview_fire_at_ms = 0;
+    g_alarm_preview_slot = -1;
+    setBrightnessRampTo(userBrightness(), RAMP_SET_MS);
+    draw();
+}
+
+// -- Alarm fire ----------------------------------------------------------
+// Minimum-viable fire: every armed alarm beeps via the speaker tone API
+// (track playback comes once the picker lands). `` ` `` / Enter dismisses;
+// any other key snoozes for 8 minutes; `+` / `-` adjust volume mid-fire.
+static constexpr uint32_t ALARM_SNOOZE_MS    = 8 * 60 * 1000;
+static constexpr uint32_t ALARM_AUTOSTOP_MS  = 60 * 60 * 1000;  // 1 hr cumulative
+static constexpr uint32_t ALARM_BEEP_PERIOD_MS = 700;           // on/off cycle
+
+static void beepStop() {
+    M5Cardputer.Speaker.stop();
+    g_alarm_beep_on = false;
+}
+
+// `fresh` is false only for a re-fire out of snooze, which must keep the
+// pre-alarm snapshot taken at the original fire rather than overwrite it with
+// the (paused) alarm track.
+static void fireAlarm(int slot, bool fresh = true) {
+    g_alarm_fire_slot = slot;
+    // Snapshot the pre-alarm state so dismiss can restore it. Volume always;
+    // the track (with its byte position and paused state) only if one was
+    // loaded. Captured before stopPlayback tears the source down.
+    if (fresh) {
+        g_alarm_prior_volume  = g_volume;
+        g_alarm_prior_playing = g_audio_active && !g_play_path.empty();
+        g_alarm_prior_track.clear();
+        if (g_alarm_prior_playing) {
+            g_alarm_prior_track  = g_play_path;
+            g_alarm_prior_paused = g_paused;
+            uint32_t pos = 0;
+            if (g_audio_mutex) {
+                xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+                if (g_src) pos = g_src->getPos();
+                xSemaphoreGive(g_audio_mutex);
+            }
+            g_alarm_prior_pos = pos;
+        }
+    }
+    // Stop any music playback before the alarm takes over — otherwise the
+    // beep mixes under the track instead of replacing it.
+    stopPlayback();
+    g_alarm_firing    = true;
+    g_alarm_snoozing  = false;
+    g_alarm_active_start = millis();
+    g_alarm_active_total = 0;
+    g_snooze_until_ms = 0;
+    g_alarm_beep_last_ms = 0;
+    g_alarm_beep_on = false;
+    g_alarm_prior_brightness_idx = (uint8_t)g_brightness_idx;
+    setBrightnessRampTo(userBrightness(), RAMP_WAKE_MS);
+    // Start the configured track; fall back to the beep tone when the slot
+    // has no track or the file can't be opened (SD missing, file gone).
+    const std::string& track = g_alarms[slot].track;
+    g_alarm_beep_fallback = track.empty() ? false : !startPlayback(track);
+    // Apply the alarm's volume. With ramp_s > 0 the auto-ramp starts at 0
+    // and climbs to the configured volume; otherwise start at the target.
+    g_alarm_ramp_overridden = false;
+    g_volume = (g_alarms[slot].ramp_s > 0) ? 0 : g_alarms[slot].volume;
+    applyVolume();
+    drawClockScreen();
+}
+
+static void snoozeAlarm() {
+    if (!g_alarm_firing) return;
+    beepStop();
+    // Pause (don't stop) the track so the clock goes silent during the snooze
+    // gap but the track stays loaded — a dismiss from snooze then leaves it
+    // paused-and-resumable, same as dismiss while firing. Re-fire restarts it.
+    if (g_audio_active) g_paused = true;
+    g_alarm_active_total += (millis() - g_alarm_active_start);
+    g_alarm_firing  = false;
+    g_alarm_snoozing = true;
+    g_snooze_until_ms = millis() + ALARM_SNOOZE_MS;
+    // Keep the screen at the user's normal brightness during snooze — the
+    // alarm just happened, the user wants to be able to see the clock easily.
+    drawClockScreen();
+}
+
+static void dismissAlarm() {
+    if (!g_alarm_firing && !g_alarm_snoozing) return;
+    beepStop();
+    // Restore the pre-alarm state: reload the track that was playing before
+    // the alarm (at its byte position, paused or playing as it was), or stop
+    // cleanly if nothing was playing. Either way restore the user's volume so
+    // the alarm's volume doesn't stick.
+    if (g_alarm_prior_playing && SD.exists(g_alarm_prior_track.c_str())) {
+        if (startPlayback(g_alarm_prior_track, /*start_paused=*/true)) {
+            uint32_t sz = g_src ? g_src->getSize() : 0;
+            if (g_alarm_prior_pos >= g_audio_start_offset && g_alarm_prior_pos < sz) {
+                seekToByte(g_alarm_prior_pos);
+            }
+            g_paused = g_alarm_prior_paused;  // resume playing if it was
+        }
+    } else {
+        stopPlayback();
+    }
+    g_volume = g_alarm_prior_volume;
+    applyVolume();
+    g_alarm_prior_playing = false;
+    g_alarm_firing = false;
+    g_alarm_snoozing = false;
+    g_alarm_fire_slot = -1;
+    g_snooze_until_ms = 0;
+    g_alarm_active_total = 0;
+    // Always leave clock mode on dismiss — the user just confirmed they're
+    // interacting, so the bedside view shouldn't linger.
+    g_standby_active = false;
+    g_brightness_idx = g_alarm_prior_brightness_idx;
+    setBrightnessRampTo(userBrightness(), RAMP_SET_MS);
+    draw();
+}
+
+static void pollAlarmBeep() {
+    if (!g_alarm_firing) return;
+    if (!g_alarm_beep_fallback) return;  // a real track is playing; no beep
+    uint32_t now = millis();
+    if (now - g_alarm_beep_last_ms < ALARM_BEEP_PERIOD_MS) return;
+    g_alarm_beep_last_ms = now;
+    g_alarm_beep_on = !g_alarm_beep_on;
+    if (g_alarm_beep_on) {
+        M5Cardputer.Speaker.tone(880.0f, ALARM_BEEP_PERIOD_MS);
+    } else {
+        M5Cardputer.Speaker.stop();
+    }
+}
+
+// Per-second alarm scan. Fires the highest-priority matching slot when
+// today's weekday and the current HH:MM match an armed alarm; the per-slot
+// watermark prevents repeated fires within the same minute. Also drives
+// snooze re-fire and the 1-hour cumulative auto-stop.
+static void pollAlarms() {
+    static uint32_t last_ms = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - last_ms) < 1000) return;
+    last_ms = now;
+
+    if (g_alarm_preview_fire_at_ms && now >= g_alarm_preview_fire_at_ms) {
+        int slot = g_alarm_preview_slot;
+        g_alarm_preview_fire_at_ms = 0;
+        g_alarm_preview_slot = -1;
+        fireAlarm(slot);
+        return;
+    }
+    if (g_alarm_firing) {
+        uint32_t live = (now - g_alarm_active_start) + g_alarm_active_total;
+        if (live >= ALARM_AUTOSTOP_MS) { dismissAlarm(); return; }
+        // Volume ramp: scale 0 → target linearly over ramp_s seconds based
+        // on time spent live in *this* fire interval (snooze re-fires reset
+        // the live counter via the active_start reset in fireAlarm).
+        if (!g_alarm_ramp_overridden) {
+            const Alarm& a = g_alarms[g_alarm_fire_slot];
+            if (a.ramp_s > 0 && g_volume < a.volume) {
+                uint32_t interval = now - g_alarm_active_start;
+                uint32_t total_ms = (uint32_t)a.ramp_s * 1000u;
+                int new_vol = (int)(((uint32_t)a.volume * interval) / total_ms);
+                if (new_vol > a.volume) new_vol = a.volume;
+                if (new_vol > g_volume) {
+                    g_volume = new_vol;
+                    M5Cardputer.Speaker.setVolume((uint8_t)((g_volume * 255) / MAX_VOL));
+                }
+            }
+        }
+        pollAlarmBeep();
+        return;
+    }
+    if (g_alarm_snoozing) {
+        if (now >= g_snooze_until_ms) {
+            // Resume firing the same slot — keep the pre-alarm snapshot.
+            g_alarm_snoozing = false;
+            fireAlarm(g_alarm_fire_slot, /*fresh=*/false);
+        }
+        return;
+    }
+
+    rtc_date_type d; g_rtc.getDate(&d);
+    rtc_time_type t; g_rtc.getTime(&t);
+    uint8_t dow = dayOfWeekMonFirst(d.Year, d.Month, d.Date);
+    uint32_t key = ((uint32_t)d.Year * 10000u + (uint32_t)d.Month * 100u + d.Date) * 10000u
+                 + (uint32_t)t.Hours * 100u + t.Minutes;
+    for (int i = 0; i < ALARM_COUNT; ++i) {
+        const Alarm& a = g_alarms[i];
+        if (!a.enabled) continue;
+        if (!(a.days & (1 << dow))) continue;
+        if (a.hour != t.Hours || a.minute != t.Minutes) continue;
+        if (g_alarm_last_fire_key[i] == key) continue;
+        g_alarm_last_fire_key[i] = key;
+        fireAlarm(i);
+        return;
+    }
+}
+
+// Adjust the standby/clock brightness from within standby or while an alarm
+// is firing — Fn+`-`/`=` retargets the clock dim level instead of the
+// regular brightness, so the user can dial it in without leaving the screen.
+static void changeStandbyBrightness(int delta) {
+    int n = g_standby_brightness_idx + delta;
+    if (n < 0) n = 0;
+    if (n > STANDBY_BRIGHTNESS_MAX_IDX) n = STANDBY_BRIGHTNESS_MAX_IDX;
+    if (n == g_standby_brightness_idx) return;
+    g_standby_brightness_idx = n;
+    markStateDirty();
+    setBrightnessRampTo(standbyBrightness(), RAMP_SET_MS);
 }
 
 void setup() {
@@ -3262,6 +4540,7 @@ void loop() {
     // pollVisualisation() now runs in its own RTOS task — see vizTask.
     pollIMUActivity();
     pollRtcClock();
+    pollAlarms();
     pollIdleScreen();
     pollBrightnessRamp();
     fuzzyHarnessPoll();
@@ -3282,7 +4561,68 @@ void loop() {
             drawHeader();
         }
 
-        if (chess::active()) {
+        if (g_alarm_firing) {
+            // Alarm sounding. `` ` ``, Fn+` (Esc), or Enter dismiss. +/- volume.
+            // Any other key snoozes for 8 minutes. Fn+`-`/`=` adjusts clock
+            // brightness in place — the screen is the full-screen clock at
+            // user brightness during fire (bumped back up so we wake people).
+            bool snooze = false;
+            bool dismiss = false;
+            if (state.fn) {
+                for (char c : state.word) {
+                    if      (c == '`')             dismiss = true;          // Fn+` = Esc
+                    else if (c == '=' || c == '+') changeStandbyBrightness(+1);
+                    else if (c == '-' || c == '_') changeStandbyBrightness(-1);
+                }
+            } else if (state.enter) {
+                dismiss = true;
+            } else {
+                for (char c : state.word) {
+                    if      (c == '`') { dismiss = true; break; }
+                    else if (c == '-') { changeVolume(-1); g_alarm_ramp_overridden = true; }
+                    else if (c == '=') { changeVolume(+1); g_alarm_ramp_overridden = true; }
+                    else { snooze = true; }
+                }
+            }
+            if (dismiss)      dismissAlarm();
+            else if (snooze)  snoozeAlarm();
+        } else if (g_alarm_snoozing) {
+            // Snoozing: clock-only, waiting for re-fire. Only ` / Esc / Enter
+            // dismiss; +/- adjust clock brightness; everything else is ignored
+            // (the whole point of snoozing is "I don't want anything yet").
+            if (state.fn) {
+                for (char c : state.word) {
+                    if      (c == '`')             dismissAlarm();
+                    else if (c == '=' || c == '+') changeStandbyBrightness(+1);
+                    else if (c == '-' || c == '_') changeStandbyBrightness(-1);
+                }
+            } else if (state.enter) {
+                dismissAlarm();
+            } else {
+                for (char c : state.word) {
+                    if (c == '`') { dismissAlarm(); break; }
+                }
+            }
+        } else if (g_standby_active && !g_alarm_firing) {
+            // Standby mode. Fn+`-`/`=` retarget the clock brightness in place
+            // (persisted), so the user can tune it without leaving the screen.
+            // Any other letter/symbol keypress exits. Ignore for a short
+            // interval after entry so the Ctrl+A entry sequence's own key-up
+            // transitions don't fire the exit handler. Pure-modifier events
+            // (state.word empty) are ignored too — those are just Ctrl/Fn
+            // pressed/released on their own.
+            bool handled_brightness = false;
+            if (state.fn) {
+                for (char c : state.word) {
+                    if      (c == '=' || c == '+') { changeStandbyBrightness(+1); handled_brightness = true; }
+                    else if (c == '-' || c == '_') { changeStandbyBrightness(-1); handled_brightness = true; }
+                }
+            }
+            if (!handled_brightness) {
+                bool too_soon = (millis() - g_standby_entered_ms) < 400;
+                if (!too_soon && !state.word.empty()) exitStandby();
+            }
+        } else if (chess::active()) {
             // Chess owns the keyboard while up. handleKey returns true when
             // the key was consumed; a false return means the user pressed
             // something chess doesn't recognise, so we drop the mode and
@@ -3320,11 +4660,117 @@ void loop() {
                 if (g_show_settings) drawSettings();
                 else                 draw();
             }
+        } else if (g_show_set_time) {
+            if (state.fn) {
+                for (char c : state.word) if (c == '`') { exitSetTime(); break; }
+            } else if (state.enter) {
+                activateSetTimeRow();
+            } else if (state.del) {
+                exitSetTime();
+            } else {
+                for (char c : state.word) {
+                    if      (c == ';') moveSetTimeCursor(-1);
+                    else if (c == '.') moveSetTimeCursor(+1);
+                    else if (c == ',') adjustSetTimeRow(-1);
+                    else if (c == '/') {
+                        int row = g_sct_cursor;
+                        if (row == SCT_COMMIT || row == SCT_BACK) activateSetTimeRow();
+                        else adjustSetTimeRow(+1);
+                    }
+                    else if (c == '?' || c == '`') { exitSetTime(); break; }
+                }
+            }
+        } else if (g_show_days_editor) {
+            // Days toggles (nested under the alarm editor). `;`/`.` move,
+            // `,`/`/`/Enter toggle the highlighted day (or Back), Del/`/?/Fn+`
+            // back out to the alarm editor.
+            if (state.fn) {
+                for (char c : state.word) {
+                    if (c == '`') { exitDaysEditor(); break; }
+                    else if (c == '=' || c == '+') changeBrightness(+1);
+                    else if (c == '-' || c == '_') changeBrightness(-1);
+                }
+            } else if (state.space) {
+                togglePause();
+            } else if (state.enter) {
+                activateDaysEditorRow();
+            } else if (state.del) {
+                exitDaysEditor();
+            } else {
+                for (char c : state.word) {
+                    if      (c == ';') moveDaysEditorCursor(-1);
+                    else if (c == '.') moveDaysEditorCursor(+1);
+                    else if (c == ',' || c == '/') activateDaysEditorRow();
+                    else if (c == '-') changeVolume(-1);
+                    else if (c == '=') changeVolume(+1);
+                    else if (c == '?' || c == '`') { exitDaysEditor(); break; }
+                }
+            }
+        } else if (g_show_alarm_editor) {
+            if (state.fn) {
+                for (char c : state.word) {
+                    if (c == '`') { exitAlarmEditor(); break; }
+                    else if (c == '=' || c == '+') changeBrightness(+1);
+                    else if (c == '-' || c == '_') changeBrightness(-1);
+                }
+            } else if (state.space) {
+                togglePause();
+            } else if (state.enter) {
+                activateAlarmEditorRow();
+            } else if (state.del) {
+                exitAlarmEditor();
+            } else {
+                for (char c : state.word) {
+                    if      (c == ';') moveAlarmEditorCursor(-1);
+                    else if (c == '.') moveAlarmEditorCursor(+1);
+                    else if (c == ',') adjustAlarmEditorRow(-1);
+                    else if (c == '/') {
+                        // `/` increments numerics / activates actions, mirroring
+                        // Alarms/Settings.
+                        int row = g_alarm_editor_cursor;
+                        if (row == AE_TRACK || row == AE_PREVIEW || row == AE_BACK
+                            || row == AE_ENABLED || row == AE_DAYS) {
+                            activateAlarmEditorRow();
+                        } else {
+                            adjustAlarmEditorRow(+1);
+                        }
+                    }
+                    else if (c == '-') changeVolume(-1);
+                    else if (c == '=') changeVolume(+1);
+                    else if (c == '?' || c == '`') { exitAlarmEditor(); break; }
+                }
+            }
+        } else if (g_show_alarms) {
+            // Alarms screen: same nav idiom as Settings, plus Enter as a
+            // sub-menu activator and Del/backspace as an explicit back.
+            if (state.fn) {
+                for (char c : state.word) {
+                    if (c == '`') { exitAlarms(); break; }
+                    else if (c == '=' || c == '+') changeBrightness(+1);
+                    else if (c == '-' || c == '_') changeBrightness(-1);
+                }
+            } else if (state.space) {
+                togglePause();
+            } else if (state.enter) {
+                activateAlarmsRow();
+            } else if (state.del) {
+                exitAlarms();
+            } else {
+                for (char c : state.word) {
+                    if      (c == ';') moveAlarmsCursor(-1);
+                    else if (c == '.') moveAlarmsCursor(+1);
+                    else if (c == ',') adjustAlarmsRow(-1);
+                    else if (c == '/') adjustAlarmsRow(+1);
+                    else if (c == '-') changeVolume(-1);
+                    else if (c == '=') changeVolume(+1);
+                    else if (c == '?' || c == '`') { exitAlarms(); break; }
+                }
+            }
         } else if (g_show_settings) {
             // Settings screen: ; / . move cursor, , / / adjust the row
             // (toggle off/on, numeric -/+ , or activate an action row),
-            // Fn+` or ? dismisses. Volume (- / =) and pause (space) also
-            // pass through so the user can keep adjusting playback.
+            // Fn+`, ?, ` or Del dismisses. Volume (- / =) and pause (space)
+            // also pass through so the user can keep adjusting playback.
             if (state.fn) {
                 for (char c : state.word) {
                     if      (c == '`') { dismissSettings(); break; }
@@ -3333,6 +4779,8 @@ void loop() {
                 }
             } else if (state.space) {
                 togglePause();
+            } else if (state.del) {
+                dismissSettings();
             } else {
                 for (char c : state.word) {
                     if      (c == ';') moveSettingsCursor(-1);
@@ -3374,6 +4822,10 @@ void loop() {
                     if      (c == 'W' || c == 'w') toggleWaveform();
                     else if (c == 'S' || c == 's') toggleSpectrum();
                     else if (c == 'T' || c == 't') toggleTestPattern();
+                    // Diagnostics toggles in place — the visualisation stays
+                    // up; draw() inside toggleDiagnostics recomposes it at the
+                    // new browser-slot dimensions.
+                    else if (c == 'D' || c == 'd') toggleDiagnostics();
                 }
             } else if (state.space) {
                 togglePause();
@@ -3400,11 +4852,7 @@ void loop() {
                         // branch as a one-shot is a no-op; pollSeekKeys
                         // does the actual work.
                         case '[': case ']': break;
-                        // Diagnostics row toggles in place — the
-                        // visualisation stays up; draw() inside
-                        // toggleDiagnostics recomposes at the new
-                        // browser-slot dimensions.
-                        case '`': toggleDiagnostics(); break;
+                        case '`': enterStandby(); break;  // clock-mode entry from viz overlay
                         // Everything else — navigation, structural, view
                         // toggles — dismisses.
                         default: dismiss = true; break;
@@ -3423,8 +4871,10 @@ void loop() {
                     case '`':
                         // Fn+` is labelled "esc". In-overlay esc is handled by
                         // the viz-overlay branch (which snapshots and dismisses
-                        // via snapshotAndDismissViz); here, esc exits search.
-                        if (g_search_active) exitSearch();
+                        // via snapshotAndDismissViz); here, esc backs out of a
+                        // sub-context (track pick, then search).
+                        if (g_pick_slot >= 0)     exitPickMode(/*restore_path=*/true);
+                        else if (g_search_active) exitSearch();
                         break;
                     // Brightness shortcut. Accepts both the shifted and
                     // unshifted forms so users don't have to remember
@@ -3443,6 +4893,7 @@ void loop() {
                 if (c == 'S' || c == 's') toggleSpectrum();
                 if (c == 'T' || c == 't') toggleTestPattern();
                 if (c == 'H' || c == 'h') enterChess();
+                if (c == 'D' || c == 'd') toggleDiagnostics();
             }
         } else if (state.tab) {
             // Tab outside viz overlay restores the last-shown combination
@@ -3453,9 +4904,11 @@ void loop() {
             }
         } else if (state.del) {
             // In search mode, backspace edits the query and exits when
-            // empty. Outside search, delete opens the reset confirmation.
-            if (g_search_active) searchBackspace();
-            else                 showResetModal();
+            // empty. In track-pick mode, Del cancels back to the editor.
+            // Otherwise, Del opens the reset confirmation.
+            if (g_search_active)    searchBackspace();
+            else if (g_pick_slot >= 0) exitPickMode(/*restore_path=*/true);
+            else                    showResetModal();
         } else {
             // Plain bindings — fire only when Fn is not held. In search
             // mode, alphanumeric characters and space append to the query;
@@ -3479,7 +4932,14 @@ void loop() {
                     case '-': changeVolume(-1); break;
                     case '+': changeFontNotch(+1); break;
                     case '_': changeFontNotch(-1); break;
-                    case '`':  toggleDiagnostics(); break;
+                    case '`':
+                        // Esc/clock key. The clock is only for the top of the
+                        // browse hierarchy; inside a sub-context it backs out
+                        // one level instead of entering standby.
+                        if (g_pick_slot >= 0)     exitPickMode(/*restore_path=*/true);
+                        else if (g_search_active) exitSearch();
+                        else                      enterStandby();
+                        break;
                     case '\\': toggleWrapNames(); break;
                     case '{':  skipTrack(-1); break;
                     case '}':  skipTrack(+1); break;
@@ -3517,8 +4977,13 @@ void loop() {
 
     if (g_advance_pending) {
         g_advance_pending = false;
-        if (g_auto_play_next) skipTrack(+1);
-        else                  drawFooter();
+        if (g_alarm_firing && !g_alarm_beep_fallback) {
+            // Loop the alarm track: restart it from the top rather than
+            // advancing to the next file in the folder.
+            startPlayback(g_alarms[g_alarm_fire_slot].track);
+            applyVolume();
+        } else if (g_auto_play_next) skipTrack(+1);
+        else                         drawFooter();
     }
 
     bool playing = false;

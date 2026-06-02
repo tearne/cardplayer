@@ -3,6 +3,7 @@
 [Down](#screen-layout)
 [Down](#playback)
 [Down](#chess)
+[Down](#alarm)
 [Down](#controls)
 [Down](#persisted-state)
 
@@ -29,6 +30,7 @@ Application
 ├ Playback
 │ └ Audio Formats
 ├ Chess
+├ Alarm (TODO)
 ├ Controls
 └ Persisted State
 ```
@@ -346,6 +348,12 @@ Entered with `Ctrl+H`; exits on `Fn+\`` or any unrecognised keypress, returning 
 - [Controls](#controls) — `Ctrl+H` entry
 
 - [Persisted State](#persisted-state) — NVS storage
+
+# Alarm
+
+[Up](#application)
+
+Bedside alarm-clock feature: a full-screen standby clock (`Ctrl+A`), up to five configurable alarms managed from Settings, and fire/snooze/dismiss behaviour that pre-empts whatever the device was doing. (TODO: placeholder only — not yet mapped. To be fleshed out alongside the screen-mode / key-mapping review.)
 
 # Persisted State
 
