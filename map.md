@@ -1,54 +1,64 @@
 # Application
 
-[Down](#screen-layout)
-[Down](#playback)
+[Down](#main)
+[Down](#settings)
 [Down](#chess)
-[Down](#alarm)
-[Down](#controls)
+[Down](#standby-clock)
+[Down](#playback)
+[Down](#controls-and-navigation)
+[Down](#screen-idle)
 [Down](#persisted-state)
 
-A minimal media player for MP3 and FLAC files on the M5Stack Cardputer.
+A minimal media player for MP3 and FLAC files on the M5Stack Cardputer. The tree below mirrors how the device is navigated — screens nest by how they are reached, and Esc backs out toward [Main](#main) — with cross-cutting subsystems (playback, input, persistence) as their own branches.
 
 ```
 Application
-├ Screen Layout
+├ Main
 │ ├ Header
 │ │ ├ Version
 │ │ ├ Path Breadcrumb
 │ │ ├ Battery
 │ │ │ └ Emergency Shutdown
 │ │ └ Diagnostics
-│ ├ Browser
-│ │ ├ Fuzzy Search
-│ │ └ Visualisation
-│ │   ├ Waveform
-│ │   └ Spectrum
 │ ├ Footer
-│ ├ Settings (unreviewed)
-│ │ └ Key Reference (unreviewed)
-│ └ Screen Idle (unreviewed)
+│ ├ Browser
+│ │ └ Fuzzy Search
+│ └ Visualisation
+│   ├ Waveform
+│   └ Spectrum
+├ Settings (unreviewed)
+│ ├ Key Reference
+│ ├ Reset Confirmation
+│ └ Alarms
+│   ├ Set Current Time
+│   └ Alarm Editor
+│     ├ Days
+│     └ Track Picker
+├ Chess
+├ Standby Clock
+│ └ Alarm
 ├ Playback
 │ └ Audio Formats
-├ Chess
-├ Alarm (TODO)
-├ Controls
+├ Controls and Navigation
+├ Screen Idle (unreviewed)
 └ Persisted State
 ```
 
-# Screen Layout
+# Main
 
 [Up](#application)
 [Down](#header)
-[Down](#browser)
 [Down](#footer)
-[Down](#settings)
-[Down](#screen-idle)
+[Down](#browser)
+[Down](#visualisation)
 
-The display is divided into three fixed regions: a header strip at the top, a footer strip at the bottom, and a main area in between. The main area hosts the browser. The header and footer are always present. Full-screen overlays — [Settings](#settings), [Key Reference](#key-reference), the reset confirmation modal — replace the normal composition while shown.
+The home screen and the device's root. A [Header](#header) strip at the top, a [Footer](#footer) strip at the bottom, and a main area between them showing one of three contents: the [Browser](#browser) directory listing (default), [Fuzzy Search](#fuzzy-search), or the [Visualisation](#visualisation) overlay. The header and footer belong to Main — the full-screen screens ([Settings](#settings), [Chess](#chess), [Standby Clock](#standby-clock)) replace the whole display.
+
+Esc (`` ` ``) on any other screen backs out one level toward Main; pressing it at Main, with nothing above to back out to, enters the [Standby Clock](#standby-clock). See [Controls and Navigation](#controls-and-navigation) for the full screen tree.
 
 # Header
 
-[Up](#screen-layout)
+[Up](#main)
 [Down](#version)
 [Down](#path-breadcrumb)
 [Down](#battery)
@@ -127,7 +137,7 @@ When the cell hits the empty cutoff, the device protects itself by powering off 
 > [!WARNING]
 > Unreviewed.
 
-Second row of the header, showing live device-resource readouts useful during development. Hidden by default; toggle with `` ` ``.
+Second row of the header, showing live device-resource readouts useful during development. Hidden by default; toggle with `Ctrl+D`.
 
 **Detail**
 
@@ -149,9 +159,8 @@ Second row of the header, showing live device-resource readouts useful during de
 
 # Browser
 
-[Up](#screen-layout)
+[Up](#main)
 [Down](#fuzzy-search)
-[Down](#visualisation)
 
 > [!WARNING]
 > Unreviewed.
@@ -162,18 +171,18 @@ The directory listing is a single full-width column of the current directory's e
 
 **See also**
 
-- [Controls](#controls) — wrap mode is toggled by `\`
+- [Controls](#controls-and-navigation) — wrap mode is toggled by `\`
 - [Settings](#settings) — "Hide non-audio" filter controls non-audio visibility
 
 # Fuzzy Search
 
 [Up](#browser)
 
-Type-to-search alternative to the directory listing. Pressing any letter opens this view: top row is the typed query, body shows ranked filename matches refreshed each keystroke. Enter plays the selected result and exits to its directory. Backspace-on-empty or `Fn+\`` (esc) also exit. Visually distinguished from the directory listing by a green theme.
+Type-to-search alternative to the directory listing. Pressing any letter opens this view: top row is the typed query, body shows ranked filename matches refreshed each keystroke. `/` plays the selected result and exits to its directory. Backspace-on-empty or `` ` `` (Esc) also exit. Visually distinguished from the directory listing by a green theme.
 
 **Detail**
 
-- Index on SD: `/FZTI.idx` (paths) and `/FZTI.pb` (filters + precomputed lookups). Built once per card, reused as long as the card's reported size hasn't changed — a coarse proxy for card identity that catches most card swaps. Manual rebuild via `~`.
+- Index on SD: `/FZTI.idx` (paths) and `/FZTI.pb` (filters + precomputed lookups). Built once per card, reused as long as the card's reported size hasn't changed — a coarse proxy for card identity that catches most card swaps. Manual rebuild via the Settings "Rebuild index" row.
 
 - Body (~42 KB) is lazy-loaded into RAM only while search is open. Entry pays a ~30 ms SD read; exit frees the memory back to the heap.
 
@@ -181,11 +190,11 @@ Type-to-search alternative to the directory listing. Pressing any letter opens t
 
 **See also**
 
-- [Controls](#controls) — `a`–`z` opens, `~` rebuilds, `Fn+\`` exits
+- [Controls](#controls-and-navigation) — `a`–`z` opens; `` ` `` (Esc) exits
 
 # Visualisation
 
-[Up](#browser)
+[Up](#main)
 [Down](#waveform)
 [Down](#spectrum)
 
@@ -194,13 +203,13 @@ Two scrolling overlays drawn over the [Browser](#browser) during playback: a [Wa
 **Detail**
 
 - Dual-mode height fractions: waveform 2/5 on top, spectrum 3/5 below. Single-view mode gives the whole inner area to whichever is on.
-- Every dismiss path — `Tab`, `Fn+\`` (esc), `del`, or any other key — snapshots the current `(waveform_on, spectrum_on)` pair before clearing. `Tab` outside the overlay restores from the snapshot; cold start with no snapshot shows both views.
+- Every dismiss path — `Tab`, `` ` `` (Esc), `del`, or any other key — snapshots the current `(waveform_on, spectrum_on)` pair before clearing. `Tab` outside the overlay restores from the snapshot; cold start with no snapshot shows both views.
 - The [Settings](#settings) "Auto waveform" and "Auto spectrum" toggles independently open their view at each new track's start.
 - While an overlay is up, transport, volume, brightness, pause and the diagnostics-row toggle pass through; everything else dismisses.
 
 **See also**
 
-- [Controls](#controls) — `Ctrl+W`, `Ctrl+S`, `Tab`, `Fn+\`` bindings
+- [Controls](#controls-and-navigation) — `Ctrl+W`, `Ctrl+S`, `Tab`, `` ` `` bindings
 
 # Waveform
 
@@ -227,67 +236,53 @@ Scrolling FFT spectrogram — each new column encodes the magnitude of frequency
 
 # Footer
 
-[Up](#screen-layout)
+[Up](#main)
 
 > [!WARNING]
 > Unreviewed.
 
 A thin strip at the bottom of the display carrying — left to right — the playing track's name (marquee-scrolling when longer than its slot), a progress bar, and a volume bar. The volume bar fills relative to the [Settings](#settings) "Volume max" cap, so a full bar reads as "at your chosen ceiling" rather than the hardware ceiling. The progress bar doubles as the play/pause indicator: slate-blue while playing, mid-grey while paused or stopped. The hairline framing the top of the strip is the same slate-blue as the progress bar so the footer reads as a distinct region. Always visible, independent of what the browser is showing and of any diagnostics-row toggle. When nothing is playing, the name slot shows "stopped".
 
-# Controls
+# Controls and Navigation
 
 [Up](#application)
 
-> [!WARNING]
-> Unreviewed.
+Most keys mean something specific to the **current screen**; a few are **global** and do the same thing everywhere.
 
-Everything the user does is via the Cardputer's keyboard — there is no touch or rotary input.
+- **Global (every screen)** — `` ` `` (Esc) backs out one level — or, at the [Main](#main) root, opens the [Standby Clock](#standby-clock) — and the transport/display keys (pause, volume, skip, seek, brightness) stay live so playback is always controllable. They yield only while typing in search or at a confirmation modal.
+- **Per screen** — the arrow cluster `;` `.` `,` `/` (the keyboard's up / down / left / right) navigates and activates: up/down move the cursor, left steps out, right enters or adjusts — the exact effect depends on the screen. `Enter` and `Del` are likewise screen-local; letters and digits type into [Fuzzy Search](#fuzzy-search) or chess.
+- **From [Main](#main)** — `Ctrl`-combos open the other screens: `Ctrl+/` [Settings](#settings), `Ctrl+W`/`S` [Visualisation](#visualisation), `Ctrl+H` [Chess](#chess), `Ctrl+D` [Diagnostics](#diagnostics).
 
-`Fn` selects an alternate binding set; plain bindings fire only when `Fn` is not held, and Fn-modified keys with no binding are no-ops. `shift` is encoded into the printable character by the hardware (`shift+/` → `?`). `Ctrl` is used by the visualisation toggles. `opt`, `alt` are exposed by the library but ignored.
+Esc backs out along the edges of the screen tree, toward Main:
 
-The bindings:
+```
+Main  (browser / search / visualisation)
+├ Settings
+│ ├ Key Reference
+│ ├ Reset Confirmation
+│ └ Alarms
+│   ├ Set Current Time
+│   └ Alarm Editor
+│     ├ Days
+│     └ Track Picker
+├ Chess
+└ Standby Clock
+   └ Alarm        (interrupt — pre-empts any screen; dismiss restores it)
+```
 
-- `;` / `.` — move selection up / down (also moves the result cursor in search; in [Settings](#settings), moves the row cursor)
+The exhaustive key-by-key list is the on-device [Key Reference](#key-reference); it isn't duplicated here.
 
-- `,` / `/` — step out / activate the highlighted entry (descend a directory, start a track, play a search result, or adjust a [Settings](#settings) row). Auto-repeats while held.
+**Detail**
 
-- `'` — jump to the currently-playing track
+- Holding `Ctrl` makes the hardware emit the *shifted* character, so `Ctrl+w` arrives as `W` and `Ctrl+/` as `?`; bindings match those forms.
+- Brightness (`Ctrl+-`/`=`) is context-sensitive — the [Standby Clock](#standby-clock) dim level while the clock is up, the normal level otherwise.
+- Skip is `Ctrl+[`/`]`; plain `[`/`]` held is seek (a silent scrub while paused).
+- Auto-repeat (`;` `.` `,` `/`, volume, seek) is poll-driven while the key is held.
 
-- `{` / `}` — skip to previous / next track within the playing directory
+**See also**
 
-- `space` — pause / resume (passes through [Settings](#settings))
-
-- `[` / `]` — held: seek backward / forward within the current track. While paused, the position scrubs silently — resume to hear the new spot.
-
-- `1`–`0` — jump to a position within the current track (`1` = 0%, `2` = 10%, …, `0` = 90%)
-
-- `-` / `=` — volume down / up (auto-repeats; passes through [Settings](#settings))
-
-- `+` / `_` — font size up / down
-
-- `` ` `` — toggle diagnostics row visibility (in [Settings](#settings), dismisses)
-
-- `\` — toggle filename wrapping in the browser
-
-- `?` — open / close [Settings](#settings)
-
-- `Del` — backspace in search; otherwise confirm-prompt to reset saved settings
-
-- `a`–`z` — open [Fuzzy Search](#fuzzy-search), seeded with the typed letter; in search mode, letters / digits / space append to the query; in [Settings](#settings), dismisses
-
-- `~` — rebuild the fuzzy-search index in the background
-
-- `Fn+\`` (labelled "esc") — exit search; dismiss [Visualisation](#visualisation) overlay; dismiss [Settings](#settings)
-
-- `Fn+=` / `Fn+-` — brightness up / down (shifted variants `Fn++` / `Fn+_` also accepted)
-
-- `Ctrl+W` — toggle [Waveform](#waveform) overlay during playback
-
-- `Ctrl+S` — toggle [Spectrum](#spectrum) overlay during playback
-
-- `Ctrl+H` — enter [Chess](#chess)
-
-- `Tab` — toggle the [Visualisation](#visualisation) overlay during playback; restores the last-shown combination of waveform + spectrum
+- [Key Reference](#key-reference) — the on-device, authoritative binding list
+- [Persisted State](#persisted-state) — settings and playhead storage
 
 # Playback
 
@@ -331,7 +326,7 @@ The supported formats: FLAC, MP3, AAC, M4A, WAV.
 
 A side activity. Standard 8×8 board, the user plays White; moves typed in `e2e4` notation; the CPU replies. State persists across reboots so a game can be paused indefinitely and resumed. The audio task is untouched while chess is on screen, so music keeps playing.
 
-Entered with `Ctrl+H`; exits on `Fn+\`` or any unrecognised keypress, returning to whatever was on screen. Music transport keys are not consumed — they'd exit chess and fire normally. The visualisation overlay snapshot-dismisses on entry; `Tab` restores it afterwards.
+Entered with `Ctrl+H`; exits on `` ` `` (Esc) or any unrecognised keypress, returning to whatever was on screen. Global transport keys (pause, volume, skip, seek, brightness) pass through without exiting, so music stays controllable mid-game. The visualisation overlay snapshot-dismisses on entry; `Tab` restores it afterwards.
 
 **Detail**
 
@@ -345,15 +340,36 @@ Entered with `Ctrl+H`; exits on `Fn+\`` or any unrecognised keypress, returning 
 
 **See also**
 
-- [Controls](#controls) — `Ctrl+H` entry
+- [Controls](#controls-and-navigation) — `Ctrl+H` entry
 
 - [Persisted State](#persisted-state) — NVS storage
 
-# Alarm
+# Standby Clock
 
 [Up](#application)
+[Down](#alarm)
 
-Bedside alarm-clock feature: a full-screen standby clock (`Ctrl+A`), up to five configurable alarms managed from Settings, and fire/snooze/dismiss behaviour that pre-empts whatever the device was doing. (TODO: placeholder only — not yet mapped. To be fleshed out alongside the screen-mode / key-mapping review.)
+A full-screen bedside clock at a dimmed standby brightness: a large `HH:MM`, the weekday top-left and battery top-right (matched in colour), and a two-line next-alarm hint below. Entered by backing out (`` ` ``) from [Main](#main); any key returns to Main. The [Screen Idle](#screen-idle) fade is suppressed here — the dim standby level is itself the resting state.
+
+A warm, low-blue palette keeps it legible at night without raising the backlight. Armed alarms fire from here, and from any screen, via the [Alarm](#alarm) interrupt.
+
+**Detail**
+
+- Redrawn once a second from the RTC. Standby brightness is its own level (a Settings row), separate from the normal brightness.
+- The weekday is computed from the date (Zeller's congruence), not read from the RTC's weekday register.
+
+# Alarm
+
+[Up](#standby-clock)
+
+A system interrupt, not a navigable screen: an armed alarm pre-empts whatever is on screen, takes over with the wake clock at normal brightness, and plays. Any key snoozes for 8 minutes (a countdown badge shows on the clock); `` ` `` (Esc) or Enter dismisses; it auto-stops after one cumulative hour. Dismiss restores the pre-alarm state — the track that was playing, its position, and the volume.
+
+Up to five alarms are configured under Settings → [Alarms](#alarms); each fires on its chosen days at its time, playing its track at its volume (with an optional fade-in ramp), or a built-in beep if the track can't be opened.
+
+**Detail**
+
+- Polled once a second against the current minute and weekday; a per-slot watermark prevents re-firing within the same minute.
+- The chosen track loops until dismissed; snooze pauses it and re-fire restarts it.
 
 # Persisted State
 
@@ -380,13 +396,15 @@ Emergency shutdown does not save — persistence runs during normal operation, n
 
 # Settings
 
-[Up](#screen-layout)
+[Up](#application)
 [Down](#key-reference)
+[Down](#alarms)
+[Down](#reset-confirmation)
 
 > [!WARNING]
 > Unreviewed.
 
-Full-screen yellow-themed overlay reached by `?`. Surfaces every user-tunable behaviour as a row with its current value at a glance, plus a handful of action rows. The user model is "one screen lists what's adjustable and what each setting is currently set to" — discoverability and self-documentation, with the global keybinds (where they exist) still working from the browser.
+Full-screen yellow-themed overlay reached by `Ctrl+/`. Surfaces every user-tunable behaviour as a row with its current value at a glance, plus a handful of action rows. The user model is "one screen lists what's adjustable and what each setting is currently set to" — discoverability and self-documentation, with the global keybinds (where they exist) still working from the browser.
 
 Row kinds, each with a distinct state glyph:
 
@@ -396,7 +414,7 @@ Row kinds, each with a distinct state glyph:
 
 - **Action** — `>` ("press enter to activate / navigate").
 
-Navigation: `;` / `.` move the cursor (auto-repeat). `enter` toggles or activates. `,` / `/` adjust — for numeric rows, step the value (auto-repeat across long ranges like volume max 0..64); for toggle rows, `,` turns off and `/` turns on. Volume (`-` / `=`) and pause (`space`) pass through. Dismiss with `` ` ``, `?`, `Fn+\``, or any letter key.
+Navigation: `;` / `.` move the cursor (auto-repeat). `enter` toggles or activates. `,` / `/` adjust — for numeric rows, step the value (auto-repeat across long ranges like volume max 0..64); for toggle rows, `,` turns off and `/` turns on. Volume (`-` / `=`) and pause (`space`) pass through. Dismiss with `` ` `` (Esc), `Del`, or any letter key.
 
 **Detail**
 
@@ -425,11 +443,51 @@ All tunables persist via [Persisted State](#persisted-state). Settings uses a di
 > [!WARNING]
 > Unreviewed.
 
-Read-only sub-screen of [Settings](#settings) listing every key binding by section (Browse, Playback, Adjust, Misc). `;` / `.` scroll; any other key returns to Settings. Reached only via the "Key reference" row inside Settings — there is no direct keybind, because `?` now opens Settings rather than this screen.
+Read-only sub-screen of [Settings](#settings) listing every key binding by section (Browse, Playback, Adjust, Misc). The authoritative on-device key list. `;` / `.` scroll; any other key returns to Settings. Reached via the "Key reference" row in Settings; it has no direct shortcut.
+
+# Reset Confirmation
+
+[Up](#settings)
+
+A modal guarding the destructive "Reset all": `/` confirms — wiping saved settings back to defaults and returning to the root — while any other key cancels. Reached from the Settings "Reset all" row (and from `Del` in the browser).
+
+# Alarms
+
+[Up](#settings)
+[Down](#set-current-time)
+[Down](#alarm-editor)
+
+The alarm-management screen. Lists the five alarm slots — each labelled by its own config, `HH:MM` then a `MTWTFSS` day mask (a letter for an armed day, `_` for off) — with a "Set current time" row at the top and a clock-brightness row at the bottom. Selecting a slot opens its [Alarm Editor](#alarm-editor); disabled slots show dimmed.
+
+# Set Current Time
+
+[Up](#alarms)
+
+Editor for the real-time clock: hour, minute, year, month, day, then a commit row. Seeds its fields from the live clock so the user nudges deltas rather than typing from scratch; committing writes the RTC, recomputes the weekday (Zeller's), and zeroes the seconds.
+
+# Alarm Editor
+
+[Up](#alarms)
+[Down](#days)
+[Down](#track-picker)
+
+Per-slot editor: enabled toggle, hour, minute, [Days](#days), volume, fade-in ramp (seconds), track, a preview action, and back. The track row opens the [Track Picker](#track-picker); pressing left on it clears the track back to the built-in beep, and a chosen track's full name wraps across up to three dimmed lines beneath the row. Preview dims to the standby clock, waits five seconds, then fires the alarm exactly as a scheduled one would — an honest end-to-end test of the wake experience.
+
+# Days
+
+[Up](#alarm-editor)
+
+Seven day toggles (Monday–Sunday, Mon-first) plus a back row, choosing which days the alarm fires. A sub-screen of the [Alarm Editor](#alarm-editor) so the editor stays scannable; the chosen set is summarised back on the editor's Days row.
+
+# Track Picker
+
+[Up](#alarm-editor)
+
+The [Browser](#browser) reused in "pick" mode to choose an alarm's track — same navigation, but a yellow theme signals that `/` selects a track here rather than starting playback. Opens on the slot's current track (folder navigated, file highlighted) when one is set. Returns to the [Alarm Editor](#alarm-editor) and restores the main browse position, so the detour doesn't move where the user was.
 
 # Screen Idle
 
-[Up](#screen-layout)
+[Up](#application)
 
 > [!WARNING]
 > Unreviewed.
@@ -446,9 +504,9 @@ Three states: **FULL** (user-set brightness), **FADING** (linear ramp toward zer
 
 - Brightness levels (8): `6, 7, 8, 16, 32, 64, 128, 192, 255`. Floor of 6 because the panel produces no visible backlight at ≤ 5 on this hardware. Default 255.
 
-- `Fn+=` / `Fn+-` step brightness globally; the brightness ramp on user change is 200 ms (responsive without feeling abrupt).
+- `Ctrl+-` / `Ctrl+=` step brightness globally (context-sensitive — see [Controls and Navigation](#controls-and-navigation)); the brightness ramp on user change is 200 ms (responsive without feeling abrupt).
 
-- The [Diagnostics](#diagnostics) row exposes `to` (seconds until fade fires) and `im` (last IMU delta in mg) for debugging idle behaviour.
+- The [Diagnostics](#diagnostics) row's `to` readout shows the seconds until the fade fires, for debugging idle behaviour.
 
 **See also**
 

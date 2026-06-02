@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.12 — 2026-06-02
+
+- Alarm tweaks. While an alarm sounds the clock time turns white. Enter dismisses the alarm but leaves the track playing to its natural end; from snooze, Enter restarts the alarm track from the top. `` ` `` (Esc) stops and returns to the previous track, paused. The clock time no longer shifts position between the standby, firing, and snooze screens.
+
 ## 0.24.4 — 2026-06-02
 
 - Key mapping overhaul. Commands now use Ctrl + unshifted keys only — Fn is retired, Shift is for typing. `` ` `` (Esc) consistently backs out of any screen. Settings is `Ctrl+/`, skip `Ctrl+[`/`]`, brightness `Ctrl+-`/`=`; volume/pause/skip/seek/brightness work from every screen (menus, chess) without leaving it. Internally, the scattered per-screen state flags are replaced by a single screen-tree model. On-device Key Reference updated (`^` = Ctrl).

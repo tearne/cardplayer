@@ -31,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.24.5";
+static constexpr const char* APP_VERSION = "0.24.12";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -4020,7 +4020,6 @@ static uint8_t  g_alarm_prior_brightness_idx = 0;
 static int         g_alarm_prior_volume = 0;
 static std::string g_alarm_prior_track;
 static uint32_t    g_alarm_prior_pos    = 0;
-static bool        g_alarm_prior_paused = false;
 static bool        g_alarm_prior_playing = false;  // a track was loaded pre-alarm
 // Volume ramp: linear from 0 → configured over ramp_s seconds. Once the
 // user presses +/- mid-fire, `ramp_overridden` latches and the auto-ramp
@@ -4116,6 +4115,7 @@ static void drawClockScreen() {
     constexpr uint16_t COL_CLOCK_PRIMARY   = 0xFEC0;  // bright amber — the time
     constexpr uint16_t COL_CLOCK_SECONDARY = 0xFD40;  // amber — day / battery / hint
     constexpr uint16_t COL_CLOCK_ALERT     = 0xFB00;  // deep orange — fire / snooze
+    constexpr uint16_t COL_CLOCK_FIRING    = 0xFFFF;  // white — the time while the alarm sounds
 
     // Status strip: today's weekday top-left and battery top-right, matched
     // in colour and size so they read as a pair.
@@ -4132,40 +4132,39 @@ static void drawClockScreen() {
     }
 
     // Big HH:MM centred — size 7 → 42 px char width × 56 px tall.
+    // Firing turns the time white as an unmistakable "alarm is live" cue;
+    // standby/snooze keep the warm amber.
+    bool firing = g_screen == Screen::AlarmFiring;
     char hhmm[6];
     snprintf(hhmm, sizeof(hhmm), "%02u:%02u", rt.Hours, rt.Minutes);
     d.setTextSize(7);
-    d.setTextColor(COL_CLOCK_PRIMARY, BLACK);
+    d.setTextColor(firing ? COL_CLOCK_FIRING : COL_CLOCK_PRIMARY, BLACK);
     int big_w = (int)strlen(hhmm) * 42;
     int big_h = 56;
-    // Standby/snooze drop the time a little lower so it sits balanced between
-    // the corner status text and the two-line next-alarm hint. Firing keeps it
-    // higher because its dismiss prompt needs the extra room below.
-    bool firing = g_screen == Screen::AlarmFiring;
-    int big_y = firing ? 22 : 28;
+    // One fixed vertical position across standby / firing / snooze so the time
+    // doesn't jump as the screen changes, balanced below the status strip.
+    // Firing's three hint lines are packed against the bottom edge to clear it.
+    int big_y = 28;
     d.setCursor((SCREEN_W - big_w) / 2, big_y);
     d.print(hhmm);
 
-    int below_y = big_y + big_h + (firing ? 4 : 2);
+    int below_y = big_y + big_h + 2;
     if (firing) {
-        // Two mirrored "label: action" hints near the bottom. ` reads as Esc
-        // from the user's side, so it isn't spelled out separately.
-        d.setTextSize(2);
-        d.setTextColor(COL_CLOCK_ALERT, BLACK);
-        const char* dm = "Esc/Enter: dismiss";
-        d.setCursor((SCREEN_W - (int)strlen(dm) * 12) / 2, SCREEN_H - 38);
-        d.print(dm);
-        d.setTextColor(COL_CLOCK_SECONDARY, BLACK);
-        const char* snz = "other key: snooze";
-        d.setCursor((SCREEN_W - (int)strlen(snz) * 12) / 2, SCREEN_H - 18);
-        d.print(snz);
+        // Three "label: action" hints near the bottom. Enter and Esc now do
+        // different things, so each is spelled out. ` reads as Esc from the
+        // user's side.
+        drawClockSubtext("Enter: dismiss",      SCREEN_H - 49, 2, COL_CLOCK_ALERT);
+        drawClockSubtext("Esc: stop",           SCREEN_H - 33, 2, COL_CLOCK_ALERT);
+        drawClockSubtext("any key: snooze",     SCREEN_H - 17, 2, COL_CLOCK_SECONDARY);
     } else if (g_screen == Screen::AlarmSnoozing) {
         uint32_t now = millis();
         uint32_t remain = (g_snooze_until_ms > now) ? (g_snooze_until_ms - now) : 0;
         int rs = (int)(remain / 1000);
         char snz[20];
         snprintf(snz, sizeof(snz), "Snooze %d:%02d", rs / 60, rs % 60);
-        drawClockSubtext(snz, below_y, 3, COL_CLOCK_ALERT);  // alarm still pending
+        // Sits lower than the standby next-alarm hint so it's centred in the
+        // space below the time rather than crowding it.
+        drawClockSubtext(snz, below_y + 14, 3, COL_CLOCK_ALERT);  // alarm still pending
     } else {
         // Next-alarm hint: "next:" label on its own line, the alarm's weekday
         // and time on the line below.
@@ -4244,15 +4243,14 @@ static void beepStop() {
 static void fireAlarm(int slot, bool fresh = true) {
     g_alarm_fire_slot = slot;
     // Snapshot the pre-alarm state so dismiss can restore it. Volume always;
-    // the track (with its byte position and paused state) only if one was
-    // loaded. Captured before stopPlayback tears the source down.
+    // the track (with its byte position) only if one was loaded. Captured
+    // before stopPlayback tears the source down.
     if (fresh) {
         g_alarm_prior_volume  = g_volume;
         g_alarm_prior_playing = g_audio_active && !g_play_path.empty();
         g_alarm_prior_track.clear();
         if (g_alarm_prior_playing) {
             g_alarm_prior_track  = g_play_path;
-            g_alarm_prior_paused = g_paused;
             uint32_t pos = 0;
             if (g_audio_mutex) {
                 xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
@@ -4304,16 +4302,17 @@ static void dismissAlarm() {
     if (g_screen != Screen::AlarmFiring && g_screen != Screen::AlarmSnoozing) return;
     beepStop();
     // Restore the pre-alarm state: reload the track that was playing before
-    // the alarm (at its byte position, paused or playing as it was), or stop
-    // cleanly if nothing was playing. Either way restore the user's volume so
-    // the alarm's volume doesn't stick.
+    // the alarm (at its byte position), or stop cleanly if nothing was playing.
+    // Either way restore the user's volume so the alarm's volume doesn't stick.
+    // Returns paused regardless of the prior play state — a dismissed alarm
+    // shouldn't leave music suddenly playing at the bedside.
     if (g_alarm_prior_playing && SD.exists(g_alarm_prior_track.c_str())) {
         if (startPlayback(g_alarm_prior_track, /*start_paused=*/true)) {
             uint32_t sz = g_src ? g_src->getSize() : 0;
             if (g_alarm_prior_pos >= g_audio_start_offset && g_alarm_prior_pos < sz) {
                 seekToByte(g_alarm_prior_pos);
             }
-            g_paused = g_alarm_prior_paused;  // resume playing if it was
+            g_paused = true;  // come back paused even if it was playing
         }
     } else {
         stopPlayback();
@@ -4330,6 +4329,53 @@ static void dismissAlarm() {
     g_brightness_idx = g_alarm_prior_brightness_idx;
     setBrightnessRampTo(userBrightness(), RAMP_SET_MS);
     draw();
+}
+
+// Shared tail for the "wake to the music" exits (Enter from firing or snooze):
+// leave clock mode for Main at the user's brightness without the snapshot
+// restore that dismiss does. The caller has already arranged the track and
+// volume; this just clears the alarm bookkeeping and returns.
+static void wakeToMain() {
+    g_alarm_prior_playing = false;
+    g_alarm_fire_slot = -1;
+    g_snooze_until_ms = 0;
+    g_alarm_active_total = 0;
+    g_screen = Screen::Main;
+    g_brightness_idx = g_alarm_prior_brightness_idx;
+    setBrightnessRampTo(userBrightness(), RAMP_SET_MS);
+    draw();
+}
+
+// The auto-ramp stops the moment we leave the firing screen, so a wake settles
+// the volume on the slot's configured target — unless the user already nudged
+// it mid-fire, in which case their level stands.
+static void settleAlarmWakeVolume() {
+    if (g_alarm_ramp_overridden) return;
+    g_volume = g_alarms[g_alarm_fire_slot].volume;
+    applyVolume();
+}
+
+// Enter while firing: wake to the alarm track. Unlike dismiss, the pre-alarm
+// state is *not* restored — the alarm track keeps playing where it is and
+// stops on its own when it reaches the end.
+static void acceptAlarm() {
+    if (g_screen != Screen::AlarmFiring) return;
+    beepStop();
+    if (g_alarm_beep_fallback) stopPlayback();  // no real track to wake to
+    else                       settleAlarmWakeVolume();
+    wakeToMain();
+}
+
+// Enter while snoozing: wake to the alarm track played from the top. The
+// snoozed track is paused partway through, so restart it from the beginning
+// rather than resuming mid-track; it then plays out and stops on its own.
+static void wakeFromSnooze() {
+    if (g_screen != Screen::AlarmSnoozing) return;
+    beepStop();
+    const std::string& track = g_alarms[g_alarm_fire_slot].track;
+    if (!track.empty() && startPlayback(track)) settleAlarmWakeVolume();
+    else                                        stopPlayback();
+    wakeToMain();
 }
 
 static void pollAlarmBeep() {
@@ -4691,25 +4737,25 @@ void loop() {
         if (consumed) {
             // Handled by the universal pre-pass above.
         } else if (g_screen == Screen::AlarmFiring) {
-            // Alarm sounding. `` ` `` (pre-pass) or Enter dismisses; +/- adjust
-            // volume; any other key snoozes for 8 minutes.
-            bool snooze = false;
-            bool dismiss = false;
+            // Alarm sounding. `` ` `` (pre-pass) stops and restores the prior
+            // track (paused); Enter wakes to the alarm track, leaving it
+            // playing; +/- adjust volume; any other key snoozes for 8 minutes.
             if (state.enter) {
-                dismiss = true;
+                acceptAlarm();
             } else {
+                bool snooze = false;
                 for (char c : state.word) {
                     if      (c == '-') { changeVolume(-1); g_alarm_ramp_overridden = true; }
                     else if (c == '=') { changeVolume(+1); g_alarm_ramp_overridden = true; }
                     else { snooze = true; }
                 }
+                if (snooze) snoozeAlarm();
             }
-            if (dismiss)      dismissAlarm();
-            else if (snooze)  snoozeAlarm();
         } else if (g_screen == Screen::AlarmSnoozing) {
-            // Snoozing: clock-only, waiting for re-fire. `` ` `` (pre-pass) or
-            // Enter dismiss; everything else is ignored.
-            if (state.enter) dismissAlarm();
+            // Snoozing: clock-only, waiting for re-fire. `` ` `` (pre-pass)
+            // stops and restores the prior track (paused); Enter wakes to the
+            // alarm track from the top; everything else is ignored.
+            if (state.enter) wakeFromSnooze();
         } else if (g_screen == Screen::Standby) {
             // Standby: any key exits (after a short post-entry guard so the
             // entry keypress's own transients don't immediately exit). `` ` ``
