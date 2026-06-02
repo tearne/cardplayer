@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.4 — 2026-06-02
+
+- Key mapping overhaul. Commands now use Ctrl + unshifted keys only — Fn is retired, Shift is for typing. `` ` `` (Esc) consistently backs out of any screen. Settings is `Ctrl+/`, skip `Ctrl+[`/`]`, brightness `Ctrl+-`/`=`; volume/pause/skip/seek/brightness work from every screen (menus, chess) without leaving it. Internally, the scattered per-screen state flags are replaced by a single screen-tree model. On-device Key Reference updated (`^` = Ctrl).
+
 ## 0.23.12 — 2026-06-02
 
 - Alarm clock. Up to five alarms managed from Settings, a full-screen standby clock (Esc / `` ` ``), and fire/snooze/dismiss that restores prior playback. Volume bar now shows the numeric level.

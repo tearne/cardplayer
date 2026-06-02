@@ -31,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.23.12";
+static constexpr const char* APP_VERSION = "0.24.5";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -239,20 +239,50 @@ static int  g_font_notch     = 1;
 static bool g_diagnostics_hidden = true;
 static int  g_indexing_phase     = 0;
 static uint32_t g_indexing_last_ms = 0;
-static bool g_show_settings  = false;
-static bool g_show_help      = false;  // key reference sub-screen (reached from settings)
-static bool g_standby_active = false;  // full-screen clock at standby brightness
-static bool g_alarm_firing   = false;  // alarm sounding (set by pollAlarms, cleared on dismiss/auto-stop)
-static bool g_alarm_snoozing = false;  // snoozed mid-fire; full-screen clock continues at standby brightness
-static bool g_show_alarms    = false;  // Alarms sub-menu (from Settings → Alarms...)
 static int  g_alarms_cursor  = 0;
-static bool g_show_alarm_editor = false;
 static int  g_alarm_editor_slot = 0;
 static int  g_alarm_editor_cursor = 0;
 static int  g_alarm_editor_top = 0;  // first visible row; the Track row's
                                      // variable height needs running-y scroll
-static bool g_show_days_editor = false;  // Days toggles, nested under the editor
 static int  g_days_editor_cursor = 0;
+// --- Screen state (single source of truth, replacing the g_show_* flags) ---
+// One enum names the current screen. The Main screen's content (file browser
+// / search / visualisation) stays a sub-state of Main, tracked by the existing
+// g_search_active / visualisation flags. parentOf() encodes the navigation
+// tree so back-out is one "go to parent" step. AlarmFiring/Snoozing are a
+// system interrupt that pre-empts any screen and restores it on dismiss, so
+// they sit outside the tree.
+enum class Screen {
+    Main, Settings, KeyReference, ResetModal,
+    Alarms, SetTime, AlarmEditor, DaysEditor, TrackPicker,
+    Chess, Standby, AlarmFiring, AlarmSnoozing,
+};
+static Screen g_screen = Screen::Main;
+// The reset modal can be opened from Settings or from the browser, so it
+// remembers where to return on dismiss.
+static Screen g_modal_return = Screen::Main;
+
+// Render whatever screen g_screen names (the single render entry point).
+static void renderScreen();
+// Switch to a screen and render it.
+static void goToScreen(Screen s);
+// Back out one level to the parent; from the Main root this enters Standby.
+static void backOut();
+
+static Screen parentOf(Screen s) {
+    switch (s) {
+        case Screen::Settings:     return Screen::Main;
+        case Screen::KeyReference: return Screen::Settings;
+        case Screen::ResetModal:   return Screen::Settings;
+        case Screen::Alarms:       return Screen::Settings;
+        case Screen::SetTime:      return Screen::Alarms;
+        case Screen::AlarmEditor:  return Screen::Alarms;
+        case Screen::DaysEditor:   return Screen::AlarmEditor;
+        case Screen::TrackPicker:  return Screen::AlarmEditor;
+        default:                   return Screen::Main;  // Main, Chess, Standby, alarm interrupt
+    }
+}
+
 // Preview state — forward-declared here so activateAlarmEditorRow can set
 // it; the firing logic lives near the fire helpers below.
 static uint32_t g_alarm_preview_fire_at_ms = 0;
@@ -268,7 +298,6 @@ static std::string g_pick_saved_path;
 static int         g_pick_saved_cursor = 0;
 // Set-current-time editor: draft values held in these globals while the
 // user adjusts; committed to the RTC on the Commit action row.
-static bool     g_show_set_time = false;
 static int      g_sct_cursor = 0;
 static uint16_t g_sct_year   = 2026;
 static uint8_t  g_sct_month  = 1;
@@ -351,21 +380,19 @@ static bool g_wrap_names     = true;
 // version on a fresh boot, then the slot is repurposed for orientation
 // once they start interacting.
 static bool g_first_keypress_seen = false;
-// Reset confirmation modal — full-screen overlay; Enter confirms, any
-// other key cancels.
-static bool g_show_reset_modal    = false;
 
 // True whenever any full-screen overlay (settings, key reference, reset
 // modal) is occluding the normal browser/header/footer composition.
 // Used to suppress redraws and key handlers that don't apply while an
 // overlay is on top.
 static inline bool fullScreenClockActive() {
-    return g_standby_active || g_alarm_firing || g_alarm_snoozing;
+    return g_screen == Screen::Standby || g_screen == Screen::AlarmFiring
+        || g_screen == Screen::AlarmSnoozing;
 }
 static inline bool overlayActive() {
-    return g_show_help || g_show_settings || g_show_reset_modal || chess::active()
-        || fullScreenClockActive() || g_show_alarms || g_show_alarm_editor
-        || g_show_days_editor || g_show_set_time;
+    // Everything except the Main browser and the (browser-rendered) track
+    // picker occludes the normal browser/header/footer composition.
+    return g_screen != Screen::Main && g_screen != Screen::TrackPicker;
 }
 
 struct FontNotch {
@@ -443,6 +470,15 @@ static constexpr int      DUAL_DENOM        = 5;
 // Fuzzy search mode — alternative to the directory listing. Active state
 // hides the directory and shows a query input + ranked results.
 static bool                            g_search_active = false;
+// Global playback transport (pause / volume / skip / seek) is live on every
+// screen except text entry (search), the modal, and the bespoke clock/alarm
+// screens (which handle those keys themselves — e.g. firing's volume carries a
+// ramp-override side effect, and standby treats any key as exit).
+static inline bool transportAllowed() {
+    return !(g_screen == Screen::Main && g_search_active)
+        && g_screen != Screen::ResetModal
+        && !fullScreenClockActive();
+}
 static String                          g_search_query;
 static std::vector<FuzzyIndex::Hit>    g_search_hits;
 static std::vector<std::string>        g_search_paths;
@@ -806,14 +842,7 @@ static void loadState() {
     g_hide_non_audio     = g_prefs.getBool  ("hidena", g_hide_non_audio);
     g_auto_play_next     = g_prefs.getBool  ("autonx", g_auto_play_next);
     g_auto_waveform      = g_prefs.getBool  ("autowv", g_auto_waveform);
-    // One-shot rename "autohm" → "autosp": prefer the new key; fall back
-    // to the legacy key if a pre-rename install hasn't flushed yet. The
-    // legacy key is removed in flushStateIfDirty once the new one is written.
-    if (g_prefs.isKey("autosp")) {
-        g_auto_spectrum  = g_prefs.getBool("autosp", g_auto_spectrum);
-    } else {
-        g_auto_spectrum  = g_prefs.getBool("autohm", g_auto_spectrum);
-    }
+    g_auto_spectrum      = g_prefs.getBool  ("autosp", g_auto_spectrum);
     g_volume_max         = g_prefs.getInt   ("volmax", g_volume_max);
     g_idle_timeout_idx   = g_prefs.getInt   ("idleto", g_idle_timeout_idx);
     g_brightness_idx     = g_prefs.getInt   ("bright", g_brightness_idx);
@@ -865,7 +894,6 @@ static void flushStateIfDirty() {
     g_prefs.putBool  ("autonx", g_auto_play_next);
     g_prefs.putBool  ("autowv", g_auto_waveform);
     g_prefs.putBool  ("autosp", g_auto_spectrum);
-    g_prefs.remove("autohm");
     g_prefs.putInt   ("volmax", g_volume_max);
     g_prefs.putInt   ("idleto", g_idle_timeout_idx);
     g_prefs.putInt   ("bright", g_brightness_idx);
@@ -1254,11 +1282,13 @@ static void enterChess() {
         snapshotAndDismissViz();
     }
     chess::enter();
+    g_screen = Screen::Chess;
     draw();
 }
 
 static void exitChess() {
     chess::exit();
+    g_screen = Screen::Main;
     draw();
 }
 
@@ -1532,7 +1562,7 @@ static void pollBattery(bool force = false) {
 
     if (level != g_battery_level) {
         g_battery_level = level;
-        if (!g_show_help) drawHeader();
+        if (g_screen != Screen::KeyReference) drawHeader();
     }
 
     if (level == 0) {
@@ -2469,9 +2499,8 @@ static void jumpToTenth(int digit_index) {
 }
 
 static void pollSeekKeys() {
-    if (overlayActive()) return;
+    if (!transportAllowed()) return;  // seek is global transport, sans clock/modal/text
     auto state = M5Cardputer.Keyboard.keysState();
-    if (state.fn) return;  // Fn+[/] has no binding; don't fall through to plain
     int direction = 0;
     for (char c : state.word) {
         if (c == '[') direction = -1;
@@ -2525,8 +2554,10 @@ static void adjustSetTimeRow(int delta);
 static void activateSetTimeRow();
 
 static void pollSettingsKeys() {
-    if (!g_show_settings && !g_show_alarms && !g_show_alarm_editor
-        && !g_show_days_editor && !g_show_set_time) {
+    bool menu_screen = g_screen == Screen::Settings || g_screen == Screen::Alarms
+        || g_screen == Screen::AlarmEditor || g_screen == Screen::DaysEditor
+        || g_screen == Screen::SetTime;
+    if (!menu_screen) {
         g_settings_press_ms  = 0;
         g_settings_repeat_key = 0;
         return;
@@ -2551,24 +2582,24 @@ static void pollSettingsKeys() {
     }
     uint32_t now = millis();
     auto fire = [&]() {
-        if (g_show_set_time) {
+        if (g_screen == Screen::SetTime) {
             if      (active == ';') moveSetTimeCursor(-1);
             else if (active == '.') moveSetTimeCursor(+1);
             else if (active == ',') adjustSetTimeRow(-1);
             else if (active == '/') adjustSetTimeRow(+1);
             return;
         }
-        if (g_show_days_editor) {
+        if (g_screen == Screen::DaysEditor) {
             // Only the cursor repeats; auto-repeating a day toggle would
             // flip-flop the bit.
             if      (active == ';') moveDaysEditorCursor(-1);
             else if (active == '.') moveDaysEditorCursor(+1);
-        } else if (g_show_alarm_editor) {
+        } else if (g_screen == Screen::AlarmEditor) {
             if      (active == ';') moveAlarmEditorCursor(-1);
             else if (active == '.') moveAlarmEditorCursor(+1);
             else if (active == ',') adjustAlarmEditorRow(-1);
             else if (active == '/') adjustAlarmEditorRow(+1);
-        } else if (g_show_alarms) {
+        } else if (g_screen == Screen::Alarms) {
             if      (active == ';') moveAlarmsCursor(-1);
             else if (active == '.') moveAlarmsCursor(+1);
             else if (active == ',') adjustAlarmsRow(-1);
@@ -2635,7 +2666,7 @@ static uint32_t g_vol_press_ms = 0;
 static uint32_t g_vol_last_ms  = 0;
 
 static void pollVolumeKeys() {
-    if (g_show_reset_modal || g_show_help) {
+    if (g_screen == Screen::ResetModal || g_screen == Screen::KeyReference) {
         g_vol_press_ms = 0;
         return;
     }
@@ -2687,7 +2718,7 @@ static void changeBrightness(int delta) {
     g_brightness_idx = n;
     setBrightnessRampTo(userBrightness(), RAMP_SET_MS);
     markStateDirty();
-    if (g_show_settings) drawSettings();
+    if (g_screen == Screen::Settings) drawSettings();
 }
 
 static void changeFontNotch(int delta) {
@@ -2735,23 +2766,24 @@ struct HelpEntry { const char* key; const char* desc; };
 static const HelpEntry HELP_ENTRIES[] = {
     {"",      "Browse"},
     {"; .",   "Up / down"},
-    {", /",   "Parent / enter"},
+    {", /",   "Up lvl / enter"},
+    {"`",     "Back / clock"},
     {"'",     "Playing track"},
     {"a-z",   "Search"},
     {"",      "Playback"},
-    {"Enter", "Play"},
     {"Space", "Pause"},
-    {"{ }",   "Prev / next"},
+    {"^[ ]",  "Prev / next"},
     {"[ ]",   "Seek (hold)"},
     {"1..0",  "Jump to %"},
     {"",      "Adjust"},
     {"= -",   "Volume"},
-    {"+ _",   "Font size"},
-    {"`",     "Diagnostics"},
+    {"^= -",  "Brightness"},
     {"\\",    "Wrap names"},
-    {"",      "Misc"},
-    {"?",     "Settings"},
-    {"Fn+`",  "Esc"},
+    {"",      "Misc (^ = Ctrl)"},
+    {"^/",    "Settings"},
+    {"^W ^S", "Wave / spectrum"},
+    {"^H",    "Chess"},
+    {"^D",    "Diagnostics"},
 };
 static constexpr int HELP_ENTRY_COUNT = (int)(sizeof(HELP_ENTRIES) / sizeof(HELP_ENTRIES[0]));
 
@@ -2871,7 +2903,7 @@ static void drawHelp() {
 }
 
 static void showHelp() {
-    g_show_help = true;
+    g_screen = Screen::KeyReference;
     g_help_top  = 0;
     drawHelp();
 }
@@ -3054,12 +3086,12 @@ static void drawSettings() {
 }
 
 static void showSettings() {
-    g_show_settings = true;
+    g_screen = Screen::Settings;
     drawSettings();
 }
 
 static void dismissSettings() {
-    g_show_settings = false;
+    g_screen = Screen::Main;
     draw();
 }
 
@@ -3101,7 +3133,7 @@ static void activateSettingsRow() {
     } else if (r.kind == SRK_ACTION) {
         switch (id) {
             case SR_KEY_REF:
-                g_show_help = true;
+                g_screen    = Screen::KeyReference;
                 g_help_top  = 0;
                 drawHelp();
                 break;
@@ -3204,15 +3236,15 @@ static void drawResetModal() {
 }
 
 static void showResetModal() {
-    g_show_reset_modal = true;
+    g_modal_return = g_screen;
+    g_screen = Screen::ResetModal;
     drawResetModal();
 }
 
 // Reset confirmed: wipe NVS, reset in-memory state, stop playback, return
 // to root, dismiss the modal and any open settings, redraw.
 static void confirmReset() {
-    g_show_reset_modal = false;
-    g_show_settings    = false;
+    g_screen = Screen::Main;
     stopPlayback();
     resetState();
     loadDir(g_cur_path);  // already "/" after resetState
@@ -3221,9 +3253,7 @@ static void confirmReset() {
 }
 
 static void dismissResetModal() {
-    g_show_reset_modal = false;
-    if (g_show_settings) drawSettings();
-    else                 draw();
+    goToScreen(g_modal_return);
 }
 
 // -- Alarms sub-menu -----------------------------------------------------
@@ -3341,14 +3371,13 @@ static void drawAlarms() {
 }
 
 static void enterAlarms() {
-    g_show_alarms = true;
+    g_screen = Screen::Alarms;
     g_alarms_cursor = 0;
     drawAlarms();
 }
 
 static void exitAlarms() {
-    g_show_alarms = false;
-    if (g_show_settings) drawSettings(); else draw();
+    goToScreen(Screen::Settings);
 }
 
 static void moveAlarmsCursor(int delta) {
@@ -3571,13 +3600,12 @@ static void enterAlarmEditor(int slot) {
     g_alarm_editor_slot = slot;
     g_alarm_editor_cursor = 0;
     g_alarm_editor_top = 0;
-    g_show_alarm_editor = true;
+    g_screen = Screen::AlarmEditor;
     drawAlarmEditor();
 }
 
 static void exitAlarmEditor() {
-    g_show_alarm_editor = false;
-    if (g_show_alarms) drawAlarms(); else draw();
+    goToScreen(Screen::Alarms);
 }
 
 static void adjustAlarmEditorRow(int delta) {
@@ -3642,9 +3670,7 @@ static void activateAlarmEditorRow() {
         g_pick_slot = g_alarm_editor_slot;
         g_pick_saved_path   = g_cur_path;
         g_pick_saved_cursor = g_cursor;
-        g_show_alarm_editor = false;
-        g_show_alarms       = false;
-        g_show_settings     = false;
+        g_screen = Screen::TrackPicker;
         // Open the picker on the slot's current track (folder navigated, file
         // highlighted) so editing an existing alarm starts in context; an
         // empty slot or a vanished folder falls back to the last position.
@@ -3658,9 +3684,6 @@ static void activateAlarmEditorRow() {
         // for a real fire; any key in that 5 s window cancels.
         g_alarm_preview_slot       = g_alarm_editor_slot;
         g_alarm_preview_fire_at_ms = millis() + 5000;
-        g_show_alarm_editor = false;
-        g_show_alarms       = false;
-        g_show_settings     = false;
         enterStandby();
         return;
     }
@@ -3738,13 +3761,12 @@ static void drawDaysEditor() {
 
 static void enterDaysEditor() {
     g_days_editor_cursor = 0;
-    g_show_days_editor = true;
+    g_screen = Screen::DaysEditor;
     drawDaysEditor();
 }
 
 static void exitDaysEditor() {
-    g_show_days_editor = false;
-    drawAlarmEditor();
+    goToScreen(Screen::AlarmEditor);
 }
 
 static void moveDaysEditorCursor(int delta) {
@@ -3840,13 +3862,12 @@ static void enterSetTime() {
     g_sct_hour  = t.Hours;
     g_sct_min   = t.Minutes;
     g_sct_cursor = 0;
-    g_show_set_time = true;
+    g_screen = Screen::SetTime;
     drawSetTime();
 }
 
 static void exitSetTime() {
-    g_show_set_time = false;
-    if (g_show_alarms) drawAlarms(); else draw();
+    goToScreen(Screen::Alarms);
 }
 
 static void commitSetTime() {
@@ -4120,12 +4141,13 @@ static void drawClockScreen() {
     // Standby/snooze drop the time a little lower so it sits balanced between
     // the corner status text and the two-line next-alarm hint. Firing keeps it
     // higher because its dismiss prompt needs the extra room below.
-    int big_y = g_alarm_firing ? 22 : 28;
+    bool firing = g_screen == Screen::AlarmFiring;
+    int big_y = firing ? 22 : 28;
     d.setCursor((SCREEN_W - big_w) / 2, big_y);
     d.print(hhmm);
 
-    int below_y = big_y + big_h + (g_alarm_firing ? 4 : 2);
-    if (g_alarm_firing) {
+    int below_y = big_y + big_h + (firing ? 4 : 2);
+    if (firing) {
         // Two mirrored "label: action" hints near the bottom. ` reads as Esc
         // from the user's side, so it isn't spelled out separately.
         d.setTextSize(2);
@@ -4137,7 +4159,7 @@ static void drawClockScreen() {
         const char* snz = "other key: snooze";
         d.setCursor((SCREEN_W - (int)strlen(snz) * 12) / 2, SCREEN_H - 18);
         d.print(snz);
-    } else if (g_alarm_snoozing) {
+    } else if (g_screen == Screen::AlarmSnoozing) {
         uint32_t now = millis();
         uint32_t remain = (g_snooze_until_ms > now) ? (g_snooze_until_ms - now) : 0;
         int rs = (int)(remain / 1000);
@@ -4156,9 +4178,35 @@ static void drawClockScreen() {
     presentFrame();
 }
 
+// Single render entry point — dispatches on the current screen. The Main and
+// TrackPicker screens both render the browser (TrackPicker is the browser in
+// pick theme); draw() handles that path including search / visualisation.
+static void renderScreen() {
+    switch (g_screen) {
+        case Screen::Settings:      drawSettings();   break;
+        case Screen::KeyReference:  drawHelp();        break;
+        case Screen::ResetModal:    drawResetModal();  break;
+        case Screen::Alarms:        drawAlarms();      break;
+        case Screen::SetTime:       drawSetTime();     break;
+        case Screen::AlarmEditor:   drawAlarmEditor(); break;
+        case Screen::DaysEditor:    drawDaysEditor();  break;
+        case Screen::Standby:
+        case Screen::AlarmFiring:
+        case Screen::AlarmSnoozing: drawClockScreen(); break;
+        case Screen::Chess:         chess::render(g_canvas); presentFrame(); break;
+        case Screen::Main:
+        case Screen::TrackPicker:   draw();            break;
+    }
+}
+
+static void goToScreen(Screen s) {
+    g_screen = s;
+    renderScreen();
+}
+
 static void enterStandby() {
-    if (g_standby_active) return;
-    g_standby_active = true;
+    if (g_screen == Screen::Standby) return;
+    g_screen = Screen::Standby;
     g_standby_entered_ms = millis();
     // Short ramp (1 s) — long enough to hide the redraw-vs-PWM-step beat
     // that reads as a flash, short enough that the linear-in-PWM ramp
@@ -4168,8 +4216,8 @@ static void enterStandby() {
 }
 
 static void exitStandby() {
-    if (!g_standby_active) return;
-    g_standby_active = false;
+    if (g_screen != Screen::Standby) return;
+    g_screen = Screen::Main;
     // Cancel any pending preview — the user actively exited.
     g_alarm_preview_fire_at_ms = 0;
     g_alarm_preview_slot = -1;
@@ -4217,8 +4265,7 @@ static void fireAlarm(int slot, bool fresh = true) {
     // Stop any music playback before the alarm takes over — otherwise the
     // beep mixes under the track instead of replacing it.
     stopPlayback();
-    g_alarm_firing    = true;
-    g_alarm_snoozing  = false;
+    g_screen = Screen::AlarmFiring;
     g_alarm_active_start = millis();
     g_alarm_active_total = 0;
     g_snooze_until_ms = 0;
@@ -4239,15 +4286,14 @@ static void fireAlarm(int slot, bool fresh = true) {
 }
 
 static void snoozeAlarm() {
-    if (!g_alarm_firing) return;
+    if (g_screen != Screen::AlarmFiring) return;
     beepStop();
     // Pause (don't stop) the track so the clock goes silent during the snooze
     // gap but the track stays loaded — a dismiss from snooze then leaves it
     // paused-and-resumable, same as dismiss while firing. Re-fire restarts it.
     if (g_audio_active) g_paused = true;
     g_alarm_active_total += (millis() - g_alarm_active_start);
-    g_alarm_firing  = false;
-    g_alarm_snoozing = true;
+    g_screen = Screen::AlarmSnoozing;
     g_snooze_until_ms = millis() + ALARM_SNOOZE_MS;
     // Keep the screen at the user's normal brightness during snooze — the
     // alarm just happened, the user wants to be able to see the clock easily.
@@ -4255,7 +4301,7 @@ static void snoozeAlarm() {
 }
 
 static void dismissAlarm() {
-    if (!g_alarm_firing && !g_alarm_snoozing) return;
+    if (g_screen != Screen::AlarmFiring && g_screen != Screen::AlarmSnoozing) return;
     beepStop();
     // Restore the pre-alarm state: reload the track that was playing before
     // the alarm (at its byte position, paused or playing as it was), or stop
@@ -4275,21 +4321,19 @@ static void dismissAlarm() {
     g_volume = g_alarm_prior_volume;
     applyVolume();
     g_alarm_prior_playing = false;
-    g_alarm_firing = false;
-    g_alarm_snoozing = false;
     g_alarm_fire_slot = -1;
     g_snooze_until_ms = 0;
     g_alarm_active_total = 0;
     // Always leave clock mode on dismiss — the user just confirmed they're
     // interacting, so the bedside view shouldn't linger.
-    g_standby_active = false;
+    g_screen = Screen::Main;
     g_brightness_idx = g_alarm_prior_brightness_idx;
     setBrightnessRampTo(userBrightness(), RAMP_SET_MS);
     draw();
 }
 
 static void pollAlarmBeep() {
-    if (!g_alarm_firing) return;
+    if (g_screen != Screen::AlarmFiring) return;
     if (!g_alarm_beep_fallback) return;  // a real track is playing; no beep
     uint32_t now = millis();
     if (now - g_alarm_beep_last_ms < ALARM_BEEP_PERIOD_MS) return;
@@ -4319,7 +4363,7 @@ static void pollAlarms() {
         fireAlarm(slot);
         return;
     }
-    if (g_alarm_firing) {
+    if (g_screen == Screen::AlarmFiring) {
         uint32_t live = (now - g_alarm_active_start) + g_alarm_active_total;
         if (live >= ALARM_AUTOSTOP_MS) { dismissAlarm(); return; }
         // Volume ramp: scale 0 → target linearly over ramp_s seconds based
@@ -4341,10 +4385,9 @@ static void pollAlarms() {
         pollAlarmBeep();
         return;
     }
-    if (g_alarm_snoozing) {
+    if (g_screen == Screen::AlarmSnoozing) {
         if (now >= g_snooze_until_ms) {
             // Resume firing the same slot — keep the pre-alarm snapshot.
-            g_alarm_snoozing = false;
             fireAlarm(g_alarm_fire_slot, /*fresh=*/false);
         }
         return;
@@ -4378,6 +4421,36 @@ static void changeStandbyBrightness(int delta) {
     g_standby_brightness_idx = n;
     markStateDirty();
     setBrightnessRampTo(standbyBrightness(), RAMP_SET_MS);
+}
+
+// Brightness is context-sensitive: the standby/clock dim level while the
+// full-screen clock is up, the normal screen brightness otherwise.
+static void changeBrightnessContext(int delta) {
+    if (fullScreenClockActive()) changeStandbyBrightness(delta);
+    else                         changeBrightness(delta);
+}
+
+// Universal back-out (the Esc key). Each screen knows where "back" goes; from
+// the Main root, backing out past the top enters the Standby clock.
+static void backOut() {
+    switch (g_screen) {
+        case Screen::AlarmFiring:
+        case Screen::AlarmSnoozing: dismissAlarm();        return;
+        case Screen::Standby:       exitStandby();         return;
+        case Screen::Chess:         exitChess();           return;
+        case Screen::ResetModal:    dismissResetModal();   return;
+        case Screen::TrackPicker:   exitPickMode(true);    return;
+        case Screen::Main:
+            if (g_search_active) { exitSearch(); return; }
+            if (g_waveform_active || g_spectrum_active || g_viz_test_pattern) {
+                snapshotAndDismissViz(); return;
+            }
+            enterStandby();  // nothing above the root → the clock
+            return;
+        default:  // Settings, KeyReference, Alarms, SetTime, AlarmEditor, DaysEditor
+            goToScreen(parentOf(g_screen));
+            return;
+    }
 }
 
 void setup() {
@@ -4561,67 +4634,89 @@ void loop() {
             drawHeader();
         }
 
-        if (g_alarm_firing) {
-            // Alarm sounding. `` ` ``, Fn+` (Esc), or Enter dismiss. +/- volume.
-            // Any other key snoozes for 8 minutes. Fn+`-`/`=` adjusts clock
-            // brightness in place — the screen is the full-screen clock at
-            // user brightness during fire (bumped back up so we wake people).
+        // --- Universal pre-pass, before the per-screen dispatch -----------
+        // Category 1 (Back): `` ` `` backs out on any non-clock screen; the
+        // clock screens keep their own `` ` `` (dismiss / timed exit) below.
+        // Category 2 (global transport): pause / volume / skip / seek and
+        // brightness reach every screen per their scope, so menus and chess
+        // keep playback control without intercepting it per-branch.
+        bool consumed = false;
+        // Standby is excluded so its post-entry guard (below) governs `` ` ``;
+        // every other screen backs out (firing/snooze → dismiss).
+        if (g_screen != Screen::Standby) {
+            for (char c : state.word) if (c == '`') { backOut(); consumed = true; break; }
+        }
+        // Brightness rides Ctrl everywhere but the modal (context-sensitive).
+        // Skip rides Ctrl wherever transport is allowed.
+        if (!consumed && state.ctrl && g_screen != Screen::ResetModal) {
+            for (char c : state.word) {
+                if      (c == '-' || c == '_') { changeBrightnessContext(-1); consumed = true; }
+                else if (c == '=' || c == '+') { changeBrightnessContext(+1); consumed = true; }
+                else if ((c == '[' || c == '{') && transportAllowed()) { skipTrack(-1); consumed = true; }
+                else if ((c == ']' || c == '}') && transportAllowed()) { skipTrack(+1); consumed = true; }
+            }
+        }
+        // Plain transport — pause / volume / seek — on every transport-allowed
+        // screen (browser, menus, chess, viz; not the clock/modal/text screens,
+        // which handle these keys themselves). Seek itself is driven by the
+        // held-key poll; the tap is consumed here so it doesn't fall through.
+        if (!consumed && !state.ctrl && transportAllowed()) {
+            if (state.space) { togglePause(); consumed = true; }
+            for (char c : state.word) {
+                if      (c == '-') { changeVolume(-1); consumed = true; }
+                else if (c == '=') { changeVolume(+1); consumed = true; }
+                else if (c == '[' || c == ']') { consumed = true; }
+            }
+        }
+        // Mode switches (Ctrl + letter / Ctrl+/) live here in one place rather
+        // than duplicated per browser/viz branch — the duplication was the
+        // source of repeated missing-binding bugs. They act from the Main
+        // screen (browser / search / visualisation); the track picker just
+        // absorbs Ctrl so a stray combo doesn't leak through to search.
+        if (!consumed && state.ctrl &&
+            (g_screen == Screen::Main || g_screen == Screen::TrackPicker)) {
+            if (g_screen == Screen::Main) {
+                for (char c : state.word) {
+                    if      (c == 'W' || c == 'w') toggleWaveform();
+                    else if (c == 'S' || c == 's') toggleSpectrum();
+                    else if (c == 'T' || c == 't') toggleTestPattern();
+                    else if (c == 'H' || c == 'h') enterChess();
+                    else if (c == 'D' || c == 'd') toggleDiagnostics();
+                    else if (c == '?')             showSettings();   // Ctrl+/
+                }
+            }
+            consumed = true;
+        }
+
+        if (consumed) {
+            // Handled by the universal pre-pass above.
+        } else if (g_screen == Screen::AlarmFiring) {
+            // Alarm sounding. `` ` `` (pre-pass) or Enter dismisses; +/- adjust
+            // volume; any other key snoozes for 8 minutes.
             bool snooze = false;
             bool dismiss = false;
-            if (state.fn) {
-                for (char c : state.word) {
-                    if      (c == '`')             dismiss = true;          // Fn+` = Esc
-                    else if (c == '=' || c == '+') changeStandbyBrightness(+1);
-                    else if (c == '-' || c == '_') changeStandbyBrightness(-1);
-                }
-            } else if (state.enter) {
+            if (state.enter) {
                 dismiss = true;
             } else {
                 for (char c : state.word) {
-                    if      (c == '`') { dismiss = true; break; }
-                    else if (c == '-') { changeVolume(-1); g_alarm_ramp_overridden = true; }
+                    if      (c == '-') { changeVolume(-1); g_alarm_ramp_overridden = true; }
                     else if (c == '=') { changeVolume(+1); g_alarm_ramp_overridden = true; }
                     else { snooze = true; }
                 }
             }
             if (dismiss)      dismissAlarm();
             else if (snooze)  snoozeAlarm();
-        } else if (g_alarm_snoozing) {
-            // Snoozing: clock-only, waiting for re-fire. Only ` / Esc / Enter
-            // dismiss; +/- adjust clock brightness; everything else is ignored
-            // (the whole point of snoozing is "I don't want anything yet").
-            if (state.fn) {
-                for (char c : state.word) {
-                    if      (c == '`')             dismissAlarm();
-                    else if (c == '=' || c == '+') changeStandbyBrightness(+1);
-                    else if (c == '-' || c == '_') changeStandbyBrightness(-1);
-                }
-            } else if (state.enter) {
-                dismissAlarm();
-            } else {
-                for (char c : state.word) {
-                    if (c == '`') { dismissAlarm(); break; }
-                }
-            }
-        } else if (g_standby_active && !g_alarm_firing) {
-            // Standby mode. Fn+`-`/`=` retarget the clock brightness in place
-            // (persisted), so the user can tune it without leaving the screen.
-            // Any other letter/symbol keypress exits. Ignore for a short
-            // interval after entry so the Ctrl+A entry sequence's own key-up
-            // transitions don't fire the exit handler. Pure-modifier events
-            // (state.word empty) are ignored too — those are just Ctrl/Fn
-            // pressed/released on their own.
-            bool handled_brightness = false;
-            if (state.fn) {
-                for (char c : state.word) {
-                    if      (c == '=' || c == '+') { changeStandbyBrightness(+1); handled_brightness = true; }
-                    else if (c == '-' || c == '_') { changeStandbyBrightness(-1); handled_brightness = true; }
-                }
-            }
-            if (!handled_brightness) {
-                bool too_soon = (millis() - g_standby_entered_ms) < 400;
-                if (!too_soon && !state.word.empty()) exitStandby();
-            }
+        } else if (g_screen == Screen::AlarmSnoozing) {
+            // Snoozing: clock-only, waiting for re-fire. `` ` `` (pre-pass) or
+            // Enter dismiss; everything else is ignored.
+            if (state.enter) dismissAlarm();
+        } else if (g_screen == Screen::Standby) {
+            // Standby: any key exits (after a short post-entry guard so the
+            // entry keypress's own transients don't immediately exit). `` ` ``
+            // is intercepted by the pre-pass only on non-clock screens, so it
+            // reaches here and exits like any other key.
+            bool too_soon = (millis() - g_standby_entered_ms) < 400;
+            if (!too_soon && !state.word.empty()) exitStandby();
         } else if (chess::active()) {
             // Chess owns the keyboard while up. handleKey returns true when
             // the key was consumed; a false return means the user pressed
@@ -4633,7 +4728,7 @@ void loop() {
             } else {
                 draw();
             }
-        } else if (g_show_reset_modal) {
+        } else if (g_screen == Screen::ResetModal) {
             // `/` confirms the destructive action; any other key — letter,
             // del, space, anything — cancels and dismisses.
             bool confirm = false;
@@ -4643,7 +4738,7 @@ void loop() {
             } else if (!state.word.empty() || state.del || state.space) {
                 dismissResetModal();
             }
-        } else if (g_show_help) {
+        } else if (g_screen == Screen::KeyReference) {
             // Key-reference sub-screen: `;` / `.` scroll, any other key
             // returns to wherever we came from (Settings, normally).
             // Releasing `?` while Shift is still held also fires
@@ -4656,14 +4751,10 @@ void loop() {
                 else if (c == '.') { scrollHelp(+1); handled = true; }
             }
             if (!handled && !state.word.empty()) {
-                g_show_help = false;
-                if (g_show_settings) drawSettings();
-                else                 draw();
+                goToScreen(Screen::Settings);
             }
-        } else if (g_show_set_time) {
-            if (state.fn) {
-                for (char c : state.word) if (c == '`') { exitSetTime(); break; }
-            } else if (state.enter) {
+        } else if (g_screen == Screen::SetTime) {
+            if (state.enter) {
                 activateSetTimeRow();
             } else if (state.del) {
                 exitSetTime();
@@ -4677,22 +4768,13 @@ void loop() {
                         if (row == SCT_COMMIT || row == SCT_BACK) activateSetTimeRow();
                         else adjustSetTimeRow(+1);
                     }
-                    else if (c == '?' || c == '`') { exitSetTime(); break; }
                 }
             }
-        } else if (g_show_days_editor) {
+        } else if (g_screen == Screen::DaysEditor) {
             // Days toggles (nested under the alarm editor). `;`/`.` move,
-            // `,`/`/`/Enter toggle the highlighted day (or Back), Del/`/?/Fn+`
-            // back out to the alarm editor.
-            if (state.fn) {
-                for (char c : state.word) {
-                    if (c == '`') { exitDaysEditor(); break; }
-                    else if (c == '=' || c == '+') changeBrightness(+1);
-                    else if (c == '-' || c == '_') changeBrightness(-1);
-                }
-            } else if (state.space) {
-                togglePause();
-            } else if (state.enter) {
+            // `,`/`/`/Enter toggle the highlighted day (or Back), Del backs out.
+            // (Back via `` ` `` and transport are handled by the pre-pass.)
+            if (state.enter) {
                 activateDaysEditorRow();
             } else if (state.del) {
                 exitDaysEditor();
@@ -4701,21 +4783,10 @@ void loop() {
                     if      (c == ';') moveDaysEditorCursor(-1);
                     else if (c == '.') moveDaysEditorCursor(+1);
                     else if (c == ',' || c == '/') activateDaysEditorRow();
-                    else if (c == '-') changeVolume(-1);
-                    else if (c == '=') changeVolume(+1);
-                    else if (c == '?' || c == '`') { exitDaysEditor(); break; }
                 }
             }
-        } else if (g_show_alarm_editor) {
-            if (state.fn) {
-                for (char c : state.word) {
-                    if (c == '`') { exitAlarmEditor(); break; }
-                    else if (c == '=' || c == '+') changeBrightness(+1);
-                    else if (c == '-' || c == '_') changeBrightness(-1);
-                }
-            } else if (state.space) {
-                togglePause();
-            } else if (state.enter) {
+        } else if (g_screen == Screen::AlarmEditor) {
+            if (state.enter) {
                 activateAlarmEditorRow();
             } else if (state.del) {
                 exitAlarmEditor();
@@ -4735,23 +4806,12 @@ void loop() {
                             adjustAlarmEditorRow(+1);
                         }
                     }
-                    else if (c == '-') changeVolume(-1);
-                    else if (c == '=') changeVolume(+1);
-                    else if (c == '?' || c == '`') { exitAlarmEditor(); break; }
                 }
             }
-        } else if (g_show_alarms) {
+        } else if (g_screen == Screen::Alarms) {
             // Alarms screen: same nav idiom as Settings, plus Enter as a
-            // sub-menu activator and Del/backspace as an explicit back.
-            if (state.fn) {
-                for (char c : state.word) {
-                    if (c == '`') { exitAlarms(); break; }
-                    else if (c == '=' || c == '+') changeBrightness(+1);
-                    else if (c == '-' || c == '_') changeBrightness(-1);
-                }
-            } else if (state.space) {
-                togglePause();
-            } else if (state.enter) {
+            // sub-menu activator and Del as an explicit back.
+            if (state.enter) {
                 activateAlarmsRow();
             } else if (state.del) {
                 exitAlarms();
@@ -4761,25 +4821,13 @@ void loop() {
                     else if (c == '.') moveAlarmsCursor(+1);
                     else if (c == ',') adjustAlarmsRow(-1);
                     else if (c == '/') adjustAlarmsRow(+1);
-                    else if (c == '-') changeVolume(-1);
-                    else if (c == '=') changeVolume(+1);
-                    else if (c == '?' || c == '`') { exitAlarms(); break; }
                 }
             }
-        } else if (g_show_settings) {
-            // Settings screen: ; / . move cursor, , / / adjust the row
-            // (toggle off/on, numeric -/+ , or activate an action row),
-            // Fn+`, ?, ` or Del dismisses. Volume (- / =) and pause (space)
-            // also pass through so the user can keep adjusting playback.
-            if (state.fn) {
-                for (char c : state.word) {
-                    if      (c == '`') { dismissSettings(); break; }
-                    else if (c == '=' || c == '+') changeBrightness(+1);
-                    else if (c == '-' || c == '_') changeBrightness(-1);
-                }
-            } else if (state.space) {
-                togglePause();
-            } else if (state.del) {
+        } else if (g_screen == Screen::Settings) {
+            // Settings screen: ; / . move cursor, , / / adjust the row (toggle
+            // off/on, numeric -/+ , or activate an action row). Back is `` ` ``
+            // (pre-pass) or Del; transport passes through the pre-pass.
+            if (state.del) {
                 dismissSettings();
             } else {
                 for (char c : state.word) {
@@ -4787,9 +4835,6 @@ void loop() {
                     else if (c == '.') moveSettingsCursor(+1);
                     else if (c == ',') adjustSettingsRow(-1);
                     else if (c == '/') adjustSettingsRow(+1);
-                    else if (c == '-') changeVolume(-1);
-                    else if (c == '=') changeVolume(+1);
-                    else if (c == '?' || c == '`') { dismissSettings(); break; }
                     // Any letter dismisses — the user is reaching for fuzzy
                     // search or just wants out. The letter itself is
                     // consumed; the next press lands in the browser.
@@ -4806,55 +4851,22 @@ void loop() {
             // dismisses — the user is leaving the overlay to navigate,
             // search, or do something structural.
             bool dismiss = false;
-            if (state.fn) {
-                for (char c : state.word) {
-                    if      (c == '=' || c == '+') changeBrightness(+1);
-                    else if (c == '-' || c == '_') changeBrightness(-1);
-                    else                            dismiss = true;
-                }
-            } else if (state.ctrl) {
-                // Ctrl+W and Ctrl+S toggle their own overlay independently
-                // — either may turn off (clearing the overlay if it was
-                // the only one active) or turn on (adding the other view
-                // to the dual layout). Empty `word` on key release while
-                // Ctrl is still held is a no-op via the char check.
-                for (char c : state.word) {
-                    if      (c == 'W' || c == 'w') toggleWaveform();
-                    else if (c == 'S' || c == 's') toggleSpectrum();
-                    else if (c == 'T' || c == 't') toggleTestPattern();
-                    // Diagnostics toggles in place — the visualisation stays
-                    // up; draw() inside toggleDiagnostics recomposes it at the
-                    // new browser-slot dimensions.
-                    else if (c == 'D' || c == 'd') toggleDiagnostics();
-                }
-            } else if (state.space) {
-                togglePause();
-            } else if (state.del || state.tab) {
+            if (state.del || state.tab) {
                 dismiss = true;
             } else {
                 for (char c : state.word) {
                     switch (c) {
-                        // Pass-through transport / volume.
-                        case '{': skipTrack(-1); break;
-                        case '}': skipTrack(+1); break;
+                        // Transport (pause / volume / skip / seek) and back are
+                        // handled by the pre-pass; here only the viz-specific
+                        // playback jumps remain.
                         case '\'': jumpToPlaying(); break;
-                        case '-': changeVolume(-1); break;
-                        case '=': changeVolume(+1); break;
                         case '1': case '2': case '3': case '4': case '5':
                         case '6': case '7': case '8': case '9': case '0': {
                             int digit_index = (c == '0') ? 9 : (c - '1');
                             jumpToTenth(digit_index);
                             break;
                         }
-                        // Held seek lives in pollSeekKeys, not here — the
-                        // on-change dispatch fires once per press and the
-                        // poll handles repeats. [`/`]` reaching this
-                        // branch as a one-shot is a no-op; pollSeekKeys
-                        // does the actual work.
-                        case '[': case ']': break;
-                        case '`': enterStandby(); break;  // clock-mode entry from viz overlay
-                        // Everything else — navigation, structural, view
-                        // toggles — dismisses.
+                        // Everything else — navigation, structural — dismisses.
                         default: dismiss = true; break;
                     }
                     if (dismiss) break;
@@ -4863,43 +4875,11 @@ void loop() {
             if (dismiss) {
                 snapshotAndDismissViz();
             }
-        } else if (state.fn) {
-            // Fn-modified bindings only. Fn+key combos with no binding are
-            // no-ops — `Fn+volume-down` no longer triggers volume-down.
-            for (char c : state.word) {
-                switch (c) {
-                    case '`':
-                        // Fn+` is labelled "esc". In-overlay esc is handled by
-                        // the viz-overlay branch (which snapshots and dismisses
-                        // via snapshotAndDismissViz); here, esc backs out of a
-                        // sub-context (track pick, then search).
-                        if (g_pick_slot >= 0)     exitPickMode(/*restore_path=*/true);
-                        else if (g_search_active) exitSearch();
-                        break;
-                    // Brightness shortcut. Accepts both the shifted and
-                    // unshifted forms so users don't have to remember
-                    // whether shift is required for the +/- side.
-                    case '=': case '+': changeBrightness(+1); break;
-                    case '-': case '_': changeBrightness(-1); break;
-                    default:  break;
-                }
-            }
-        } else if (state.ctrl) {
-            // Ctrl-modified bindings. When Ctrl is held the keyboard library
-            // emits the value_second of each key (the shifted character), so
-            // 'w' arrives as 'W'.
-            for (char c : state.word) {
-                if (c == 'W' || c == 'w') toggleWaveform();
-                if (c == 'S' || c == 's') toggleSpectrum();
-                if (c == 'T' || c == 't') toggleTestPattern();
-                if (c == 'H' || c == 'h') enterChess();
-                if (c == 'D' || c == 'd') toggleDiagnostics();
-            }
         } else if (state.tab) {
             // Tab outside viz overlay restores the last-shown combination
             // — flicks the visualisations back in without re-selecting which
             // ones. The in-overlay Tab branch handles the hide direction.
-            if (!g_show_settings && !g_show_help && !g_search_active) {
+            if (!g_search_active) {
                 restoreVizFromSnapshot();
             }
         } else if (state.del) {
@@ -4930,21 +4910,7 @@ void loop() {
                     case ' ': togglePause(); break;
                     case '=': changeVolume(+1); break;
                     case '-': changeVolume(-1); break;
-                    case '+': changeFontNotch(+1); break;
-                    case '_': changeFontNotch(-1); break;
-                    case '`':
-                        // Esc/clock key. The clock is only for the top of the
-                        // browse hierarchy; inside a sub-context it backs out
-                        // one level instead of entering standby.
-                        if (g_pick_slot >= 0)     exitPickMode(/*restore_path=*/true);
-                        else if (g_search_active) exitSearch();
-                        else                      enterStandby();
-                        break;
                     case '\\': toggleWrapNames(); break;
-                    case '{':  skipTrack(-1); break;
-                    case '}':  skipTrack(+1); break;
-                    case '~':  FuzzyIndex::startRebuild(); break;
-                    case '?':  showSettings(); break;
                     case '\'': jumpToPlaying(); break;
                     case '1': case '2': case '3': case '4': case '5':
                     case '6': case '7': case '8': case '9': case '0': {
@@ -4977,7 +4943,7 @@ void loop() {
 
     if (g_advance_pending) {
         g_advance_pending = false;
-        if (g_alarm_firing && !g_alarm_beep_fallback) {
+        if (g_screen == Screen::AlarmFiring && !g_alarm_beep_fallback) {
             // Loop the alarm track: restart it from the top rather than
             // advancing to the next file in the folder.
             startPlayback(g_alarms[g_alarm_fire_slot].track);
