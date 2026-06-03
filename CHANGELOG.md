@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.1 — 2026-06-03
+
+- Loudness leveling: fixed the distortion on loud passages. The limiter now pulls the gain down fast enough ahead of peaks that they meet the ceiling smoothly instead of clipping. Settings → Leveling gains full control — Drive gain, Release, Attack, Lookahead, and Ceiling — and the default drive is raised to +12 dB. The amplification trace over the waveform now scales to the drive setting, so its movement (the limiter working) is clearly visible.
+
 ## 0.25.10 — 2026-06-03
 
 - Fixed larger FLAC files (notably stereo audiobooks) failing to play — they would load and immediately skip to the next track. The chess feature was permanently reserving 24 KB of memory even when unused, leaving the audio decoder too little to work with; that scratchpad is now claimed only while chess is open. Opening chess while a track is playing now asks to confirm, since it pauses playback to free memory for the chess AI; leaving chess reloads the track paused where you left off, ready to un-pause.

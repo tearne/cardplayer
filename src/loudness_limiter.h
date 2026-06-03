@@ -1,9 +1,18 @@
 // On-the-fly loudness leveling for playback. A fixed input drive gain lifts
-// quiet passages, and a lookahead brickwall limiter catches the resulting
-// peaks at a ceiling with a slow release — so an audiobook's whisper-to-shout
-// swings even out at a fixed volume without pumping. Processes one mono int16
-// sample at a time inside the audio task. Disabled by default: when off,
-// samples pass through untouched.
+// quiet passages, and a feed-forward lookahead limiter pulls the gain down
+// ahead of peaks so they meet the ceiling smoothly instead of clipping — an
+// audiobook's whisper-to-shout swings even out at a fixed volume without
+// distortion. Processes one mono int16 sample at a time inside the audio task.
+// Disabled by default: when off, samples pass through untouched.
+//
+// Lookahead structure: the signal is delayed by the lookahead, while the gain
+// envelope reacts to the *undelayed* sample. So when a loud sample arrives, the
+// gain has the whole lookahead window to ramp down (attack) before that sample
+// reaches the output. The attack therefore must be faster than the lookahead —
+// the previous version's attack matched the lookahead, reaching only ~63 % of
+// the needed reduction in time, so peaks hit the ceiling clamp and clipped. A
+// slow release holds the reduction across the delay and recovers gently. The
+// ceiling clamp remains only as a last-resort safety net.
 //
 // Lock-free by construction: the UI task writes plain scalars (and precomputed
 // coefficients) through the setters; the audio task reads them per-sample. A
@@ -16,19 +25,28 @@
 
 class LoudnessLimiter {
 public:
-    // Parameter ranges as the user reasons about them (dB / seconds).
-    static constexpr float DRIVE_DB_MIN  = 0.0f;
-    static constexpr float DRIVE_DB_MAX  = 24.0f;
-    static constexpr float RELEASE_S_MIN = 0.1f;
-    static constexpr float RELEASE_S_MAX = 2.0f;
+    // Parameter ranges as the user reasons about them.
+    static constexpr float DRIVE_DB_MIN     = 0.0f;
+    static constexpr float DRIVE_DB_MAX     = 24.0f;
+    static constexpr float RELEASE_S_MIN    = 0.1f;
+    static constexpr float RELEASE_S_MAX    = 2.0f;
+    static constexpr float ATTACK_MS_MIN    = 0.5f;
+    static constexpr float ATTACK_MS_MAX    = 10.0f;
+    static constexpr float LOOKAHEAD_MS_MIN = 1.0f;
+    static constexpr float LOOKAHEAD_MS_MAX = 12.0f;
+    static constexpr float CEILING_DB_MIN   = -6.0f;
+    static constexpr float CEILING_DB_MAX   = -0.5f;
 
     LoudnessLimiter() { _drive = dbToLinear(_drive_db); recomputeCoefficients(); }
 
     void setEnabled(bool on)        { _enabled = on; }
     void setDriveDb(float db)       { _drive_db = db; _drive = dbToLinear(db); }
-    void setReleaseSeconds(float s) { _release_s = s; recomputeCoefficients(); }
-    // The release/attack times and lookahead are expressed in seconds, so they
-    // track the live stream's sample rate; call this when the format changes.
+    void setReleaseSeconds(float s) { _release_s = s;  recomputeCoefficients(); }
+    void setAttackMs(float ms)      { _attack_ms = ms; recomputeCoefficients(); }
+    void setLookaheadMs(float ms)   { _lookahead_ms = ms; recomputeCoefficients(); }
+    void setCeilingDb(float db)     { _ceiling_db = db; recomputeCoefficients(); }
+    // Times are in seconds / ms, so they track the live stream's sample rate;
+    // call this when the format changes.
     void setSampleRate(uint32_t hz) {
         _sample_rate = hz ? hz : 44100;
         recomputeCoefficients();
@@ -37,6 +55,9 @@ public:
     bool  enabled()        const { return _enabled; }
     float driveDb()        const { return _drive_db; }
     float releaseSeconds() const { return _release_s; }
+    float attackMs()       const { return _attack_ms; }
+    float lookaheadMs()    const { return _lookahead_ms; }
+    float ceilingDb()      const { return _ceiling_db; }
 
     // Total gain currently applied to the audio vs the raw decoded sample:
     // the static drive multiplied by the live limiter gain. 1.0 (unity) when
@@ -53,21 +74,21 @@ public:
         // doesn't wrap before the limiter pulls it back.
         float driven = (float)mono * _drive;
 
-        // Emit the sample that entered the delay line `_lookahead` samples ago;
-        // the gain reduction triggered by newer (louder) samples has had the
-        // lookahead window to ramp in before that peak reaches the output.
+        // Emit the sample that entered the delay line `_lookahead` samples ago.
         float delayed = _delay[_write];
         _delay[_write] = driven;
         _write = (_write + 1) % _lookahead;
 
-        // Drop toward more reduction quickly (attack spans the lookahead so it
-        // lands as the peak arrives); recover toward unity slowly (release).
+        // Gain reduction the *incoming* sample needs. Because the output is
+        // delayed, the gain has the lookahead window to ramp to this before the
+        // sample is emitted; attack (faster than the lookahead) drops toward it,
+        // a slow release recovers and holds the reduction across the delay.
         float peak   = fabsf(driven);
         float target = (peak > _ceiling) ? _ceiling / peak : 1.0f;
         float coeff  = (target < _gain) ? _attack : _release;
         _gain += (target - _gain) * coeff;
 
-        // Brickwall: clamp catches any residue the smoothed gain didn't.
+        // Safety net only — with a correct attack this rarely does anything.
         float out = delayed * _gain;
         if (out >  _ceiling) out =  _ceiling;
         if (out < -_ceiling) out = -_ceiling;
@@ -85,29 +106,30 @@ public:
 private:
     static float dbToLinear(float db) { return powf(10.0f, db / 20.0f); }
 
-    // Everything that depends on a time constant or the sample rate: the
-    // lookahead length and the one-pole attack/release coefficients.
+    // Everything that depends on a time constant or the sample rate: lookahead
+    // length, ceiling, and the one-pole attack/release coefficients.
     void recomputeCoefficients() {
-        _ceiling = 32767.0f * dbToLinear(CEILING_DBFS);
-        int look = (int)(LOOKAHEAD_MS * 0.001f * _sample_rate + 0.5f);
+        _ceiling = 32767.0f * dbToLinear(_ceiling_db);
+        int look = (int)(_lookahead_ms * 0.001f * _sample_rate + 0.5f);
         if (look < 1)             look = 1;
         if (look > LOOKAHEAD_MAX) look = LOOKAHEAD_MAX;
         _lookahead = look;
-        // Attack ramp spans the lookahead window so reduction is fully in place
-        // by the time the triggering peak reaches the output.
-        _attack  = 1.0f - expf(-1.0f / (float)_lookahead);
-        _release = 1.0f - expf(-1.0f / (_release_s * (float)_sample_rate));
+        // One-pole coefficients from time constants. Attack is in ms and must
+        // be shorter than the lookahead for peaks to be tamed before output.
+        _attack  = 1.0f - expf(-1.0f / (_attack_ms  * 0.001f * (float)_sample_rate));
+        _release = 1.0f - expf(-1.0f / (_release_s  *          (float)_sample_rate));
     }
 
-    static constexpr float LOOKAHEAD_MS  = 3.0f;
-    static constexpr int   LOOKAHEAD_MAX = 256;   // ~5.8 ms at 44.1 kHz
-    static constexpr float CEILING_DBFS  = -1.0f; // brickwall ceiling
+    static constexpr int   LOOKAHEAD_MAX = 640;   // ≥ 12 ms at 48 kHz
 
-    bool     _enabled     = false;
-    float    _drive_db    = 6.0f;
-    float    _drive       = 1.0f;
-    float    _release_s   = 0.5f;
-    uint32_t _sample_rate = 44100;
+    bool     _enabled      = false;
+    float    _drive_db     = 6.0f;
+    float    _drive        = 1.0f;
+    float    _release_s    = 0.5f;
+    float    _attack_ms    = 1.0f;
+    float    _lookahead_ms = 5.0f;
+    float    _ceiling_db   = -1.0f;
+    uint32_t _sample_rate  = 44100;
 
     float _ceiling   = 0.0f;
     int   _lookahead = 1;

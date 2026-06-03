@@ -31,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.25.10";
+static constexpr const char* APP_VERSION = "0.26.1";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -334,11 +334,20 @@ static int  g_volume_max     = 16;   // 0..MAX_VOL ceiling on live volume
 // user knobs, mirrored into it by applyLeveling. Drive in whole dB; release
 // in tenths of a second (5 = 0.5 s).
 static bool g_leveling_enabled     = false;
-static int  g_leveling_drive_db    = 6;    // 0..24 dB
+static int  g_leveling_drive_db    = 12;   // 0..24 dB
 static int  g_leveling_release_ds  = 5;    // 1..20 → 0.1..2.0 s
-static constexpr int LEVELING_DRIVE_DB_MAX  = 24;
+static int  g_leveling_attack_hms  = 2;    // 1..20 → 0.5..10.0 ms (half-ms units)
+static int  g_leveling_lookahead_ms = 5;   // 1..12 ms
+static int  g_leveling_ceiling_hdb = 2;    // 1..12 → -0.5..-6.0 dBFS (half-dB units)
+static constexpr int LEVELING_DRIVE_DB_MAX   = 24;
 static constexpr int LEVELING_RELEASE_DS_MIN = 1;
 static constexpr int LEVELING_RELEASE_DS_MAX = 20;
+static constexpr int LEVELING_ATTACK_HMS_MIN   = 1;
+static constexpr int LEVELING_ATTACK_HMS_MAX   = 20;
+static constexpr int LEVELING_LOOKAHEAD_MS_MIN = 1;
+static constexpr int LEVELING_LOOKAHEAD_MS_MAX = 12;
+static constexpr int LEVELING_CEILING_HDB_MIN  = 1;
+static constexpr int LEVELING_CEILING_HDB_MAX  = 12;
 
 
 // Idle-screen timeout — discrete steps surfaced in settings. Index into
@@ -760,6 +769,9 @@ static void applyLeveling() {
     LoudnessLimiter& lim = g_out.limiter();
     lim.setDriveDb((float)g_leveling_drive_db);
     lim.setReleaseSeconds((float)g_leveling_release_ds / 10.0f);
+    lim.setAttackMs((float)g_leveling_attack_hms * 0.5f);
+    lim.setLookaheadMs((float)g_leveling_lookahead_ms);
+    lim.setCeilingDb(-(float)g_leveling_ceiling_hdb * 0.5f);
     lim.setEnabled(g_leveling_enabled);
 }
 
@@ -913,6 +925,9 @@ static void loadState() {
     g_leveling_enabled   = g_prefs.getBool  ("lvl",    g_leveling_enabled);
     g_leveling_drive_db  = g_prefs.getInt   ("lvldb",  g_leveling_drive_db);
     g_leveling_release_ds = g_prefs.getInt  ("lvlrel", g_leveling_release_ds);
+    g_leveling_attack_hms = g_prefs.getInt  ("lvlat",  g_leveling_attack_hms);
+    g_leveling_lookahead_ms = g_prefs.getInt("lvlla",  g_leveling_lookahead_ms);
+    g_leveling_ceiling_hdb = g_prefs.getInt ("lvlce",  g_leveling_ceiling_hdb);
     for (int i = 0; i < ALARM_COUNT; ++i) {
         char k[8];
         snprintf(k, sizeof(k), "a%d_hm", i);
@@ -943,6 +958,12 @@ static void loadState() {
     if (g_leveling_drive_db > LEVELING_DRIVE_DB_MAX) g_leveling_drive_db = LEVELING_DRIVE_DB_MAX;
     if (g_leveling_release_ds < LEVELING_RELEASE_DS_MIN) g_leveling_release_ds = LEVELING_RELEASE_DS_MIN;
     if (g_leveling_release_ds > LEVELING_RELEASE_DS_MAX) g_leveling_release_ds = LEVELING_RELEASE_DS_MAX;
+    if (g_leveling_attack_hms < LEVELING_ATTACK_HMS_MIN) g_leveling_attack_hms = LEVELING_ATTACK_HMS_MIN;
+    if (g_leveling_attack_hms > LEVELING_ATTACK_HMS_MAX) g_leveling_attack_hms = LEVELING_ATTACK_HMS_MAX;
+    if (g_leveling_lookahead_ms < LEVELING_LOOKAHEAD_MS_MIN) g_leveling_lookahead_ms = LEVELING_LOOKAHEAD_MS_MIN;
+    if (g_leveling_lookahead_ms > LEVELING_LOOKAHEAD_MS_MAX) g_leveling_lookahead_ms = LEVELING_LOOKAHEAD_MS_MAX;
+    if (g_leveling_ceiling_hdb < LEVELING_CEILING_HDB_MIN) g_leveling_ceiling_hdb = LEVELING_CEILING_HDB_MIN;
+    if (g_leveling_ceiling_hdb > LEVELING_CEILING_HDB_MAX) g_leveling_ceiling_hdb = LEVELING_CEILING_HDB_MAX;
     for (int i = 0; i < ALARM_COUNT; ++i) {
         Alarm& a = g_alarms[i];
         if (a.hour > 23)   a.hour = 7;
@@ -971,6 +992,9 @@ static void flushStateIfDirty() {
     g_prefs.putBool  ("lvl",    g_leveling_enabled);
     g_prefs.putInt   ("lvldb",  g_leveling_drive_db);
     g_prefs.putInt   ("lvlrel", g_leveling_release_ds);
+    g_prefs.putInt   ("lvlat",  g_leveling_attack_hms);
+    g_prefs.putInt   ("lvlla",  g_leveling_lookahead_ms);
+    g_prefs.putInt   ("lvlce",  g_leveling_ceiling_hdb);
     for (int i = 0; i < ALARM_COUNT; ++i) {
         char k[8];
         snprintf(k, sizeof(k), "a%d_hm", i);
@@ -1018,8 +1042,11 @@ static void resetState() {
     g_idle_timeout_idx   = 2;
     g_brightness_idx     = BRIGHTNESS_COUNT - 1;
     g_leveling_enabled   = false;
-    g_leveling_drive_db  = 6;
+    g_leveling_drive_db  = 12;
     g_leveling_release_ds = 5;
+    g_leveling_attack_hms = 2;
+    g_leveling_lookahead_ms = 5;
+    g_leveling_ceiling_hdb = 2;
     g_cur_path           = "/";
     g_cursor             = 0;
     g_play_path.clear();
@@ -2196,14 +2223,24 @@ static void drawWaveformColIntoCanvas(int y_top, int h, int x, int64_t col_abs) 
     g_canvas.drawFastVLine(x, y0, y1 - y0 + 1, COL_FOOTER_PROG);
 
     // Loudness-leveling amplification trace: a line across the upper half of
-    // the waveform whose height tracks net gain (0 dB at centre up to +24 dB
-    // at the top). Drawn as a per-column segment bridging to the previous
-    // column so it reads as a continuous scrolling line. Same accent colour
-    // as the footer "L" so the two cues are visibly one feature.
+    // the waveform whose height tracks net gain. Scaled to the current drive
+    // (full drive ≈ top, falling as the limiter pulls peaks down) rather than a
+    // fixed 0…+24 dB span, so the line uses the whole band and its dips — the
+    // limiter working — are legible. Drawn as a per-column segment bridging to
+    // the previous column so it reads as a continuous scrolling line; same
+    // accent colour as the footer cue.
     if (g_leveling_enabled) {
+        int drive_db = g_leveling_drive_db > 0 ? g_leveling_drive_db : 1;
+        auto traceY = [&](uint8_t a) {
+            float ndb  = (float)a * (WV_AMP_MAX_DB / 255.0f);
+            float frac = ndb / (float)drive_db;
+            if (frac > 1.0f) frac = 1.0f;
+            if (frac < 0.0f) frac = 0.0f;
+            return cy - (int)(frac * half_h);
+        };
         int prev_idx = (int)((((col_abs - 1) % WV_COLS) + WV_COLS) % WV_COLS);
-        int cur_y  = cy - (ring.amp[idx]      * half_h) / 255;
-        int prev_y = cy - (ring.amp[prev_idx] * half_h) / 255;
+        int cur_y  = traceY(ring.amp[idx]);
+        int prev_y = traceY(ring.amp[prev_idx]);
         int lo = (cur_y < prev_y) ? cur_y : prev_y;
         int hi = (cur_y < prev_y) ? prev_y : cur_y;
         if (lo < y_top) lo = y_top;
@@ -3630,18 +3667,21 @@ static void adjustAlarmsRow(int delta) {
 // Same nav idiom as Settings/Alarms.
 enum LevelingRowId {
     LV_ENABLED = 0,
-    LV_DRIVE, LV_RELEASE,
+    LV_DRIVE, LV_RELEASE, LV_ATTACK, LV_LOOKAHEAD, LV_CEILING,
     LV_RESET, LV_BACK,
     LV_COUNT
 };
 
 static void levelingRowLabel(int row, char* buf, size_t buflen) {
     switch (row) {
-        case LV_ENABLED: snprintf(buf, buflen, "Leveling");        return;
-        case LV_DRIVE:   snprintf(buf, buflen, "Drive gain");      return;
-        case LV_RELEASE: snprintf(buf, buflen, "Release");         return;
-        case LV_RESET:   snprintf(buf, buflen, "Reset to default");return;
-        case LV_BACK:    snprintf(buf, buflen, "Back");            return;
+        case LV_ENABLED:   snprintf(buf, buflen, "Leveling");        return;
+        case LV_DRIVE:     snprintf(buf, buflen, "Drive gain");      return;
+        case LV_RELEASE:   snprintf(buf, buflen, "Release");         return;
+        case LV_ATTACK:    snprintf(buf, buflen, "Attack");          return;
+        case LV_LOOKAHEAD: snprintf(buf, buflen, "Lookahead");       return;
+        case LV_CEILING:   snprintf(buf, buflen, "Ceiling");         return;
+        case LV_RESET:     snprintf(buf, buflen, "Reset to default");return;
+        case LV_BACK:      snprintf(buf, buflen, "Back");            return;
     }
 }
 
@@ -3651,6 +3691,11 @@ static void levelingRowValueStr(int row, char* buf, size_t buflen) {
         case LV_DRIVE:   snprintf(buf, buflen, "+%d dB", g_leveling_drive_db); return;
         case LV_RELEASE: snprintf(buf, buflen, "%d.%d s",
                                   g_leveling_release_ds / 10, g_leveling_release_ds % 10); return;
+        case LV_ATTACK:  snprintf(buf, buflen, "%d.%d ms",
+                                  g_leveling_attack_hms / 2, (g_leveling_attack_hms % 2) * 5); return;
+        case LV_LOOKAHEAD: snprintf(buf, buflen, "%d ms", g_leveling_lookahead_ms); return;
+        case LV_CEILING: snprintf(buf, buflen, "-%d.%d dB",
+                                  g_leveling_ceiling_hdb / 2, (g_leveling_ceiling_hdb % 2) * 5); return;
         case LV_RESET:   snprintf(buf, buflen, ">"); return;
         case LV_BACK:    buf[0] = '\0'; return;
     }
@@ -3665,12 +3710,23 @@ static void drawLeveling() {
     int rh = rowH();
     int cw = charW();
 
+    // Scroll to keep the cursor visible — the knob list can exceed the screen
+    // at the larger font. One row reserved for the title strip.
+    int rows_avail = SCREEN_H / rh - 1;
+    if (rows_avail < 1) rows_avail = 1;
+    static int s_top = 0;
+    if (g_leveling_cursor < s_top) s_top = g_leveling_cursor;
+    if (g_leveling_cursor >= s_top + rows_avail) s_top = g_leveling_cursor - rows_avail + 1;
+    if (s_top + rows_avail > LV_COUNT) s_top = LV_COUNT - rows_avail;
+    if (s_top < 0) s_top = 0;
+
     d.setTextColor(COL_HEADER_TXT, BLACK);
     d.setCursor(2, 0);
     d.print("Leveling");
 
-    for (int row = 0; row < LV_COUNT; ++row) {
-        int y = rh + row * rh;
+    for (int i = 0; i < rows_avail && (s_top + i) < LV_COUNT; ++i) {
+        int row = s_top + i;
+        int y = rh + i * rh;
         bool selected = (row == g_leveling_cursor);
         if (selected) {
             d.fillRect(0, y, SCREEN_W, rh, COL_SETTINGS_SEL_BG);
@@ -3711,8 +3767,11 @@ static void moveLevelingCursor(int delta) {
 // Restore the tuning knobs to their factory values, leaving the on/off
 // state as the user set it — they're in here to re-tune, not to disarm.
 static void resetLevelingToDefault() {
-    g_leveling_drive_db   = 6;
+    g_leveling_drive_db   = 12;
     g_leveling_release_ds = 5;
+    g_leveling_attack_hms = 2;
+    g_leveling_lookahead_ms = 5;
+    g_leveling_ceiling_hdb = 2;
     applyLeveling();
     markStateDirty();
     drawLeveling();
@@ -3757,6 +3816,36 @@ static void adjustLevelingRow(int delta) {
             if (n == g_leveling_release_ds) return;
             g_leveling_release_ds = n;
             g_out.limiter().setReleaseSeconds((float)g_leveling_release_ds / 10.0f);
+            markStateDirty();
+            break;
+        }
+        case LV_ATTACK: {
+            int n = g_leveling_attack_hms + delta;
+            if (n < LEVELING_ATTACK_HMS_MIN) n = LEVELING_ATTACK_HMS_MIN;
+            if (n > LEVELING_ATTACK_HMS_MAX) n = LEVELING_ATTACK_HMS_MAX;
+            if (n == g_leveling_attack_hms) return;
+            g_leveling_attack_hms = n;
+            g_out.limiter().setAttackMs((float)g_leveling_attack_hms * 0.5f);
+            markStateDirty();
+            break;
+        }
+        case LV_LOOKAHEAD: {
+            int n = g_leveling_lookahead_ms + delta;
+            if (n < LEVELING_LOOKAHEAD_MS_MIN) n = LEVELING_LOOKAHEAD_MS_MIN;
+            if (n > LEVELING_LOOKAHEAD_MS_MAX) n = LEVELING_LOOKAHEAD_MS_MAX;
+            if (n == g_leveling_lookahead_ms) return;
+            g_leveling_lookahead_ms = n;
+            g_out.limiter().setLookaheadMs((float)g_leveling_lookahead_ms);
+            markStateDirty();
+            break;
+        }
+        case LV_CEILING: {
+            int n = g_leveling_ceiling_hdb + delta;
+            if (n < LEVELING_CEILING_HDB_MIN) n = LEVELING_CEILING_HDB_MIN;
+            if (n > LEVELING_CEILING_HDB_MAX) n = LEVELING_CEILING_HDB_MAX;
+            if (n == g_leveling_ceiling_hdb) return;
+            g_leveling_ceiling_hdb = n;
+            g_out.limiter().setCeilingDb(-(float)g_leveling_ceiling_hdb * 0.5f);
             markStateDirty();
             break;
         }
