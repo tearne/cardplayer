@@ -31,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.24.12";
+static constexpr const char* APP_VERSION = "0.25.10";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -175,6 +175,10 @@ static constexpr uint16_t COL_FOOTER_TXT   = 0xFFFF;  // track name
 static constexpr uint16_t COL_FOOTER_PROG  = 0x6979;  // progress bar while playing (slate-blue)
 static constexpr uint16_t COL_FOOTER_IDLE  = 0x7BEF;  // progress bar while paused or stopped (mid-grey)
 static constexpr uint16_t COL_FOOTER_VOL   = 0x34D0;  // volume bar (muted teal)
+// Loudness-leveling accent (footer "L" + amplification trace). Warm amber so
+// it reads clearly both over the cool slate-blue waveform and against black.
+static constexpr uint16_t COL_LEVEL_ACCENT = 0xFD20;  // amber-orange
+static constexpr uint16_t COL_WARN         = 0xFB00;  // deep orange — warnings (e.g. no RTC)
 static constexpr uint16_t COL_FOOTER_FRAME = 0x6979;  // hairline above footer
 // Mode-coloured frame elements (separators above and below the main area,
 // and the scrollbar gutter) — blue in browse mode, green in search mode.
@@ -240,6 +244,7 @@ static bool g_diagnostics_hidden = true;
 static int  g_indexing_phase     = 0;
 static uint32_t g_indexing_last_ms = 0;
 static int  g_alarms_cursor  = 0;
+static int  g_leveling_cursor = 0;
 static int  g_alarm_editor_slot = 0;
 static int  g_alarm_editor_cursor = 0;
 static int  g_alarm_editor_top = 0;  // first visible row; the Track row's
@@ -255,7 +260,8 @@ static int  g_days_editor_cursor = 0;
 enum class Screen {
     Main, Settings, KeyReference, ResetModal,
     Alarms, SetTime, AlarmEditor, DaysEditor, TrackPicker,
-    Chess, Standby, AlarmFiring, AlarmSnoozing,
+    Leveling,
+    Chess, ChessConfirm, Standby, AlarmFiring, AlarmSnoozing,
 };
 static Screen g_screen = Screen::Main;
 // The reset modal can be opened from Settings or from the browser, so it
@@ -275,6 +281,8 @@ static Screen parentOf(Screen s) {
         case Screen::KeyReference: return Screen::Settings;
         case Screen::ResetModal:   return Screen::Settings;
         case Screen::Alarms:       return Screen::Settings;
+        case Screen::Leveling:     return Screen::Settings;
+        case Screen::ChessConfirm: return Screen::Main;
         case Screen::SetTime:      return Screen::Alarms;
         case Screen::AlarmEditor:  return Screen::Alarms;
         case Screen::DaysEditor:   return Screen::AlarmEditor;
@@ -290,6 +298,15 @@ static int      g_alarm_preview_slot = -1;
 // RTC defined here (rather than next to its helpers below) so the alarm
 // editor / set-time / pollAlarms code can reach it.
 static Unit_RTC g_rtc;
+// RTC presence, latched once at boot (is the Port-A add-on fitted?). When
+// false there is no timekeeping: the software clock has no seed, alarms never
+// arm or fire, and the clock UI says so rather than showing a wrong time.
+static bool     g_rtc_present   = false;
+// Software wall-clock: epoch seconds captured at the last RTC sync, plus the
+// millis() at that moment. Current time = epoch + elapsed seconds, so the
+// clock free-runs between infrequent RTC reads.
+static uint32_t g_clock_epoch   = 0;
+static uint32_t g_clock_sync_ms = 0;
 // Track picker — when `g_pick_slot >= 0` the browser is in pick mode:
 // activating an audio file sets that slot's track and returns to the
 // editor; navigation otherwise behaves as normal.
@@ -311,6 +328,17 @@ static bool g_auto_play_next = true;
 static bool g_auto_waveform  = false;
 static bool g_auto_spectrum   = false;
 static int  g_volume_max     = 16;   // 0..MAX_VOL ceiling on live volume
+
+// Loudness leveling — drive-into-a-limiter levelling of playback. The
+// limiter itself lives in the audio-output object; these are the persisted
+// user knobs, mirrored into it by applyLeveling. Drive in whole dB; release
+// in tenths of a second (5 = 0.5 s).
+static bool g_leveling_enabled     = false;
+static int  g_leveling_drive_db    = 6;    // 0..24 dB
+static int  g_leveling_release_ds  = 5;    // 1..20 → 0.1..2.0 s
+static constexpr int LEVELING_DRIVE_DB_MAX  = 24;
+static constexpr int LEVELING_RELEASE_DS_MIN = 1;
+static constexpr int LEVELING_RELEASE_DS_MAX = 20;
 
 
 // Idle-screen timeout — discrete steps surfaced in settings. Index into
@@ -477,6 +505,7 @@ static bool                            g_search_active = false;
 static inline bool transportAllowed() {
     return !(g_screen == Screen::Main && g_search_active)
         && g_screen != Screen::ResetModal
+        && g_screen != Screen::ChessConfirm
         && !fullScreenClockActive();
 }
 static String                          g_search_query;
@@ -693,12 +722,45 @@ static std::string crumbForWidth(const std::string& path, int max_chars) {
 // Forward decl so stopPlayback can force an immediate spectrum redraw
 // after hardFlush; the full definition lives further down.
 static void composeBrowser();
+// Forward decls so exitChess can rebuild the set-aside track (definitions
+// live further down with startPlayback's default argument).
+static bool startPlayback(const std::string& full_path, bool start_paused);
+static void seekToByte(uint32_t target);
+static void drawChessConfirm();
+
+// On-demand heap census over USB serial — press 'h' in the monitor. Works
+// anytime without a reboot (native USB-CDC drops the boot log on reset), and
+// breaks the heap down by capability so the DMA-reserved portion (I²S buffers)
+// is visible separately from general internal RAM.
+static void pollHeapDiag() {
+    if (!Serial.available()) return;
+    int c = Serial.read();
+    if (c != 'h' && c != 'H') return;
+    Serial.printf("[heap] default  free=%6u largest=%6u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    Serial.printf("[heap] internal free=%6u largest=%6u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    Serial.printf("[heap] dma      free=%6u largest=%6u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+}
 
 static void applyVolume() {
     // Volume goes through M5.Speaker's own digital control on the codec,
     // matching the original ESP8266Audio path. Range 0..255 maps from
     // 0..MAX_VOL.
     M5Cardputer.Speaker.setVolume((uint8_t)((g_volume * 255) / MAX_VOL));
+}
+
+// Push the persisted leveling knobs into the limiter. Called after loadState
+// and whenever a knob changes; the setters are lock-free scalar writes.
+static void applyLeveling() {
+    LoudnessLimiter& lim = g_out.limiter();
+    lim.setDriveDb((float)g_leveling_drive_db);
+    lim.setReleaseSeconds((float)g_leveling_release_ds / 10.0f);
+    lim.setEnabled(g_leveling_enabled);
 }
 
 static void stopPlayback() {
@@ -739,10 +801,11 @@ static void audioTask(void*) {
             if (!g_gen->loop()) {
                 uint32_t srcpos = g_src ? g_src->getPos()  : 0;
                 uint32_t srcsz  = g_src ? g_src->getSize() : 0;
-                Serial.printf("loop fail: samples=%u srcPos=%u/%u heap=%u: %s\n",
+                Serial.printf("loop fail: samples=%u srcPos=%u/%u heap=%u largest=%u: %s\n",
                               (unsigned)g_out.samplesConsumed(),
                               (unsigned)srcpos, (unsigned)srcsz,
                               (unsigned)ESP.getFreeHeap(),
+                              (unsigned)ESP.getMaxAllocHeap(),
                               g_play_path.c_str());
                 g_gen->stop();
                 delete g_gen; g_gen = nullptr;
@@ -847,6 +910,9 @@ static void loadState() {
     g_idle_timeout_idx   = g_prefs.getInt   ("idleto", g_idle_timeout_idx);
     g_brightness_idx     = g_prefs.getInt   ("bright", g_brightness_idx);
     g_standby_brightness_idx = g_prefs.getInt("stbybr", g_standby_brightness_idx);
+    g_leveling_enabled   = g_prefs.getBool  ("lvl",    g_leveling_enabled);
+    g_leveling_drive_db  = g_prefs.getInt   ("lvldb",  g_leveling_drive_db);
+    g_leveling_release_ds = g_prefs.getInt  ("lvlrel", g_leveling_release_ds);
     for (int i = 0; i < ALARM_COUNT; ++i) {
         char k[8];
         snprintf(k, sizeof(k), "a%d_hm", i);
@@ -873,6 +939,10 @@ static void loadState() {
     if (g_brightness_idx   < 0 || g_brightness_idx   >= BRIGHTNESS_COUNT)   g_brightness_idx   = BRIGHTNESS_COUNT - 1;
     if (g_standby_brightness_idx < 0) g_standby_brightness_idx = 0;
     if (g_standby_brightness_idx > STANDBY_BRIGHTNESS_MAX_IDX) g_standby_brightness_idx = STANDBY_BRIGHTNESS_MAX_IDX;
+    if (g_leveling_drive_db < 0) g_leveling_drive_db = 0;
+    if (g_leveling_drive_db > LEVELING_DRIVE_DB_MAX) g_leveling_drive_db = LEVELING_DRIVE_DB_MAX;
+    if (g_leveling_release_ds < LEVELING_RELEASE_DS_MIN) g_leveling_release_ds = LEVELING_RELEASE_DS_MIN;
+    if (g_leveling_release_ds > LEVELING_RELEASE_DS_MAX) g_leveling_release_ds = LEVELING_RELEASE_DS_MAX;
     for (int i = 0; i < ALARM_COUNT; ++i) {
         Alarm& a = g_alarms[i];
         if (a.hour > 23)   a.hour = 7;
@@ -898,6 +968,9 @@ static void flushStateIfDirty() {
     g_prefs.putInt   ("idleto", g_idle_timeout_idx);
     g_prefs.putInt   ("bright", g_brightness_idx);
     g_prefs.putInt   ("stbybr", g_standby_brightness_idx);
+    g_prefs.putBool  ("lvl",    g_leveling_enabled);
+    g_prefs.putInt   ("lvldb",  g_leveling_drive_db);
+    g_prefs.putInt   ("lvlrel", g_leveling_release_ds);
     for (int i = 0; i < ALARM_COUNT; ++i) {
         char k[8];
         snprintf(k, sizeof(k), "a%d_hm", i);
@@ -944,6 +1017,9 @@ static void resetState() {
     g_volume_max         = 16;
     g_idle_timeout_idx   = 2;
     g_brightness_idx     = BRIGHTNESS_COUNT - 1;
+    g_leveling_enabled   = false;
+    g_leveling_drive_db  = 6;
+    g_leveling_release_ds = 5;
     g_cur_path           = "/";
     g_cursor             = 0;
     g_play_path.clear();
@@ -1249,6 +1325,14 @@ static void toggleSpectrum() {
     draw();
 }
 
+static void toggleLeveling() {
+    g_leveling_enabled = !g_leveling_enabled;
+    g_out.limiter().setEnabled(g_leveling_enabled);
+    markStateDirty();
+    g_viz_sprite_dirty = true;  // repaint the waveform so the amp trace shows/clears at once
+    draw();                     // footer indicator reflects the new state
+}
+
 // Last-shown viz combination, restored by `Tab` when no overlay is
 // visible. Captured by every dismiss path so the restore matches what was
 // on screen at the moment it was cleared. Defaults to both views on so
@@ -1277,6 +1361,12 @@ static void restoreVizFromSnapshot() {
 // any visualisation overlay is dismissed (and not auto-restored on exit —
 // the user brings it back with Tab, matching the snapshotAndDismissViz
 // convention).
+// A track set aside when entering chess, so it can be reloaded (paused, at the
+// same spot) on the way out. Chess's search needs ~24 KB; tearing the decoder
+// down frees the memory it would otherwise be competing for.
+static std::string g_chess_resume_path;
+static uint32_t    g_chess_resume_pos = 0;
+
 static void enterChess() {
     if (g_waveform_active || g_spectrum_active || g_viz_test_pattern) {
         snapshotAndDismissViz();
@@ -1286,9 +1376,46 @@ static void enterChess() {
     draw();
 }
 
+// Enter chess having first torn the audio decoder down (freeing its memory for
+// the chess search), remembering the track + position so it can be restored
+// paused on exit. Called once the user confirms the pause.
+static void enterChessFreeingAudio() {
+    g_chess_resume_path.clear();
+    if (!g_play_path.empty()) {
+        g_chess_resume_path = g_play_path;
+        if (g_audio_mutex) xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+        g_chess_resume_pos = g_src ? g_src->getPos() : 0;
+        if (g_audio_mutex) xSemaphoreGive(g_audio_mutex);
+    }
+    stopPlayback();      // releases the decoder's heap before chess claims its scratchpad
+    enterChess();
+}
+
+// Ctrl+H entry point: a loaded track means chess would have to pause it to free
+// memory, so confirm first; otherwise enter straight away.
+static void requestChess() {
+    if (!g_play_path.empty()) {
+        g_screen = Screen::ChessConfirm;
+        drawChessConfirm();
+    } else {
+        enterChess();
+    }
+}
+
 static void exitChess() {
-    chess::exit();
+    chess::exit();       // frees the ~24 KB search scratchpad first
     g_screen = Screen::Main;
+    // Restore the set-aside track, paused at its spot — the user un-pauses to
+    // resume. Rebuilt only now that chess has released its memory.
+    if (!g_chess_resume_path.empty()) {
+        std::string path = g_chess_resume_path;
+        uint32_t    pos  = g_chess_resume_pos;
+        g_chess_resume_path.clear();
+        if (startPlayback(path, /*start_paused=*/true) && pos > 0 && g_src) {
+            uint32_t sz = g_src->getSize();
+            if (pos >= g_audio_start_offset && pos < sz) seekToByte(pos);
+        }
+    }
     draw();
 }
 
@@ -1599,7 +1726,11 @@ static void drawSlotProgress() {
     int fh = footerH();
     int by = fy + (fh - FOOTER_BAR_H) / 2;
     bool playing = !g_play_path.empty() && !g_paused;
-    uint16_t col = playing ? COL_FOOTER_PROG : COL_FOOTER_IDLE;
+    // Amber while leveling is active (replaces the old "L" glyph as the on/off
+    // cue); otherwise slate-blue while playing, grey while paused / stopped.
+    uint16_t col = !playing            ? COL_FOOTER_IDLE
+                 : g_leveling_enabled  ? COL_LEVEL_ACCENT
+                                       : COL_FOOTER_PROG;
     d.fillRect(FOOTER_PROG_X, fy, FOOTER_PROG_W, fh, BLACK);
     d.drawRect(FOOTER_PROG_X, by, FOOTER_PROG_W, FOOTER_BAR_H, col);
     if (g_src && !g_play_path.empty()) {
@@ -2063,6 +2194,22 @@ static void drawWaveformColIntoCanvas(int y_top, int h, int x, int64_t col_abs) 
     if (y1 < y0)    y1 = y0;
     g_canvas.fillRect(x, y_top, 1, h, BLACK);
     g_canvas.drawFastVLine(x, y0, y1 - y0 + 1, COL_FOOTER_PROG);
+
+    // Loudness-leveling amplification trace: a line across the upper half of
+    // the waveform whose height tracks net gain (0 dB at centre up to +24 dB
+    // at the top). Drawn as a per-column segment bridging to the previous
+    // column so it reads as a continuous scrolling line. Same accent colour
+    // as the footer "L" so the two cues are visibly one feature.
+    if (g_leveling_enabled) {
+        int prev_idx = (int)((((col_abs - 1) % WV_COLS) + WV_COLS) % WV_COLS);
+        int cur_y  = cy - (ring.amp[idx]      * half_h) / 255;
+        int prev_y = cy - (ring.amp[prev_idx] * half_h) / 255;
+        int lo = (cur_y < prev_y) ? cur_y : prev_y;
+        int hi = (cur_y < prev_y) ? prev_y : cur_y;
+        if (lo < y_top) lo = y_top;
+        if (hi > cy)    hi = cy;
+        g_canvas.drawFastVLine(x, lo, hi - lo + 1, COL_LEVEL_ACCENT);
+    }
 }
 
 // Helper for the current dual / single layout: splits the inner area
@@ -2540,6 +2687,13 @@ static char     g_settings_repeat_key = 0;
 
 static void moveAlarmsCursor(int delta);
 static void adjustAlarmsRow(int delta);
+static void syncClockFromRtc();
+static void currentClock(rtc_date_type& d, rtc_time_type& t);
+static void enterLeveling();
+static void exitLeveling();
+static void moveLevelingCursor(int delta);
+static void adjustLevelingRow(int delta);
+static void activateLevelingRow();
 static void moveAlarmEditorCursor(int delta);
 static void adjustAlarmEditorRow(int delta);
 static void activateAlarmEditorRow();
@@ -2556,7 +2710,7 @@ static void activateSetTimeRow();
 static void pollSettingsKeys() {
     bool menu_screen = g_screen == Screen::Settings || g_screen == Screen::Alarms
         || g_screen == Screen::AlarmEditor || g_screen == Screen::DaysEditor
-        || g_screen == Screen::SetTime;
+        || g_screen == Screen::SetTime || g_screen == Screen::Leveling;
     if (!menu_screen) {
         g_settings_press_ms  = 0;
         g_settings_repeat_key = 0;
@@ -2604,6 +2758,11 @@ static void pollSettingsKeys() {
             else if (active == '.') moveAlarmsCursor(+1);
             else if (active == ',') adjustAlarmsRow(-1);
             else if (active == '/') adjustAlarmsRow(+1);
+        } else if (g_screen == Screen::Leveling) {
+            if      (active == ';') moveLevelingCursor(-1);
+            else if (active == '.') moveLevelingCursor(+1);
+            else if (active == ',') adjustLevelingRow(-1);
+            else if (active == '/') adjustLevelingRow(+1);
         } else {
             if      (active == ';') moveSettingsCursor(-1);
             else if (active == '.') moveSettingsCursor(+1);
@@ -2666,7 +2825,8 @@ static uint32_t g_vol_press_ms = 0;
 static uint32_t g_vol_last_ms  = 0;
 
 static void pollVolumeKeys() {
-    if (g_screen == Screen::ResetModal || g_screen == Screen::KeyReference) {
+    if (g_screen == Screen::ResetModal || g_screen == Screen::KeyReference
+        || g_screen == Screen::ChessConfirm) {
         g_vol_press_ms = 0;
         return;
     }
@@ -2935,7 +3095,8 @@ static void showResetModal();  // defined below
 
 enum SettingsRowId {
     SR_DIAG = 0, SR_WRAP, SR_HIDE_NA, SR_AUTO_NEXT, SR_AUTO_WAVE, SR_AUTO_SPEC,
-    SR_FONT, SR_VOLMAX, SR_BRIGHT, SR_IDLE, SR_CHESS_LEVEL,
+    SR_FONT, SR_VOLMAX, SR_LEVELING,
+    SR_BRIGHT, SR_IDLE, SR_CHESS_LEVEL,
     SR_ALARMS, SR_KEY_REF, SR_REBUILD, SR_RESET,
     SR_COUNT
 };
@@ -2957,6 +3118,7 @@ static const SettingsRow SETTINGS_ROWS[SR_COUNT] = {
     {SRK_TOGGLE,  "Auto spectrum"},
     {SRK_NUMERIC, "Font size"},
     {SRK_NUMERIC, "Volume max"},
+    {SRK_ACTION,  "Leveling..."},
     {SRK_NUMERIC, "Brightness"},
     {SRK_NUMERIC, "Backlight off"},
     {SRK_NUMERIC, "Chess level"},
@@ -3144,6 +3306,9 @@ static void activateSettingsRow() {
             case SR_ALARMS:
                 enterAlarms();
                 break;
+            case SR_LEVELING:
+                enterLeveling();
+                break;
             case SR_RESET:
                 // Reset modal renders over the settings screen; on dismiss
                 // we'll redraw whichever overlay is still active.
@@ -3241,6 +3406,26 @@ static void showResetModal() {
     drawResetModal();
 }
 
+// Confirm gate before chess takes over: chess needs ~24 KB the playing track is
+// holding, so it must pause to free it.
+static void drawChessConfirm() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setTextSize(2);
+    constexpr int CELL_W = 12, CELL_H = 16;
+    auto drawLine = [&](const char* s, int y, uint16_t fg) {
+        d.setTextColor(fg, BLACK);
+        d.setCursor((SCREEN_W - (int)strlen(s) * CELL_W) / 2, y);
+        d.print(s);
+    };
+    int y = 14;
+    drawLine("Pause playback",  y, COL_FILE_BRIGHT);  y += CELL_H + 2;
+    drawLine("for chess?",      y, COL_FILE_BRIGHT);  y += CELL_H + 14;
+    drawLine("Enter = yes",     y, COL_FILE_BRIGHT);  y += CELL_H + 4;
+    drawLine("other = no",      y, COL_HEADER_TXT);
+    presentFrame();
+}
+
 // Reset confirmed: wipe NVS, reset in-memory state, stop playback, return
 // to root, dismiss the modal and any open settings, redraw.
 static void confirmReset() {
@@ -3249,6 +3434,7 @@ static void confirmReset() {
     resetState();
     loadDir(g_cur_path);  // already "/" after resetState
     applyVolume();
+    applyLeveling();
     draw();
 }
 
@@ -3304,6 +3490,13 @@ static void alarmsRowValueStr(int row, char* buf, size_t buflen) {
     }
 }
 
+// With no RTC there's no timekeeping, so every alarms row is hidden — the
+// screen is a bare warning, exited with `` ` `` / Del.
+static bool alarmsRowShown(int row) {
+    (void)row;
+    return g_rtc_present;
+}
+
 static void drawAlarms() {
     auto& d = g_canvas;
     d.fillScreen(BLACK);
@@ -3327,6 +3520,18 @@ static void drawAlarms() {
     d.setTextColor(COL_HEADER_TXT, BLACK);
     d.setCursor(2, 0);
     d.print("Alarms");
+
+    // No RTC: nothing here works, so the screen is purely a warning. Exit with
+    // `` ` `` / Del — no rows to navigate.
+    if (!g_rtc_present) {
+        d.setTextColor(COL_WARN, BLACK);
+        d.setCursor(2, rh * 2);
+        d.print("RTC not connected");
+        d.setCursor(2, rh * 3);
+        d.print("Alarms unavailable");
+        presentFrame();
+        return;
+    }
 
     for (int i = 0; i < rows_avail && (s_top + i) < AR_COUNT; ++i) {
         int row = s_top + i;
@@ -3381,7 +3586,10 @@ static void exitAlarms() {
 }
 
 static void moveAlarmsCursor(int delta) {
-    int n = ((g_alarms_cursor + delta) % AR_COUNT + AR_COUNT) % AR_COUNT;
+    int n = g_alarms_cursor;
+    do {
+        n = ((n + delta) % AR_COUNT + AR_COUNT) % AR_COUNT;
+    } while (!alarmsRowShown(n) && n != g_alarms_cursor);
     if (n == g_alarms_cursor) return;
     g_alarms_cursor = n;
     drawAlarms();
@@ -3414,6 +3622,149 @@ static void adjustAlarmsRow(int delta) {
         return;
     }
     if (delta > 0) activateAlarmsRow();  // `/` activates action rows
+}
+
+// -- Leveling sub-menu ---------------------------------------------------
+// Loudness leveling lives on its own screen rather than as flat Settings
+// rows so the tuning knobs and a "Reset to default" action group together.
+// Same nav idiom as Settings/Alarms.
+enum LevelingRowId {
+    LV_ENABLED = 0,
+    LV_DRIVE, LV_RELEASE,
+    LV_RESET, LV_BACK,
+    LV_COUNT
+};
+
+static void levelingRowLabel(int row, char* buf, size_t buflen) {
+    switch (row) {
+        case LV_ENABLED: snprintf(buf, buflen, "Leveling");        return;
+        case LV_DRIVE:   snprintf(buf, buflen, "Drive gain");      return;
+        case LV_RELEASE: snprintf(buf, buflen, "Release");         return;
+        case LV_RESET:   snprintf(buf, buflen, "Reset to default");return;
+        case LV_BACK:    snprintf(buf, buflen, "Back");            return;
+    }
+}
+
+static void levelingRowValueStr(int row, char* buf, size_t buflen) {
+    switch (row) {
+        case LV_ENABLED: snprintf(buf, buflen, "[%c]", g_leveling_enabled ? 'x' : ' '); return;
+        case LV_DRIVE:   snprintf(buf, buflen, "+%d dB", g_leveling_drive_db); return;
+        case LV_RELEASE: snprintf(buf, buflen, "%d.%d s",
+                                  g_leveling_release_ds / 10, g_leveling_release_ds % 10); return;
+        case LV_RESET:   snprintf(buf, buflen, ">"); return;
+        case LV_BACK:    buf[0] = '\0'; return;
+    }
+}
+
+static void drawLeveling() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setFont(notchFont());
+    d.setTextSize(notchSize());
+    d.setTextWrap(false, false);
+    int rh = rowH();
+    int cw = charW();
+
+    d.setTextColor(COL_HEADER_TXT, BLACK);
+    d.setCursor(2, 0);
+    d.print("Leveling");
+
+    for (int row = 0; row < LV_COUNT; ++row) {
+        int y = rh + row * rh;
+        bool selected = (row == g_leveling_cursor);
+        if (selected) {
+            d.fillRect(0, y, SCREEN_W, rh, COL_SETTINGS_SEL_BG);
+            d.setTextColor(COL_FILE_BRIGHT, COL_SETTINGS_SEL_BG);
+        } else {
+            d.setTextColor(COL_FILE_BRIGHT, BLACK);
+        }
+        char name[20];
+        levelingRowLabel(row, name, sizeof(name));
+        d.setCursor(2, y);
+        d.print(name);
+        char val[12];
+        levelingRowValueStr(row, val, sizeof(val));
+        int vw = (int)strlen(val) * cw;
+        d.setCursor(SCREEN_W - vw - 2, y);
+        d.print(val);
+    }
+    presentFrame();
+}
+
+static void enterLeveling() {
+    g_screen = Screen::Leveling;
+    g_leveling_cursor = 0;
+    drawLeveling();
+}
+
+static void exitLeveling() {
+    goToScreen(Screen::Settings);
+}
+
+static void moveLevelingCursor(int delta) {
+    int n = ((g_leveling_cursor + delta) % LV_COUNT + LV_COUNT) % LV_COUNT;
+    if (n == g_leveling_cursor) return;
+    g_leveling_cursor = n;
+    drawLeveling();
+}
+
+// Restore the tuning knobs to their factory values, leaving the on/off
+// state as the user set it — they're in here to re-tune, not to disarm.
+static void resetLevelingToDefault() {
+    g_leveling_drive_db   = 6;
+    g_leveling_release_ds = 5;
+    applyLeveling();
+    markStateDirty();
+    drawLeveling();
+}
+
+static void activateLevelingRow() {
+    switch (g_leveling_cursor) {
+        case LV_ENABLED:
+            g_leveling_enabled = !g_leveling_enabled;
+            g_out.limiter().setEnabled(g_leveling_enabled);
+            markStateDirty();
+            drawLeveling();
+            break;
+        case LV_RESET: resetLevelingToDefault(); break;
+        case LV_BACK:  exitLeveling(); break;
+        default: break;  // numeric rows adjust via , / /
+    }
+}
+
+static void adjustLevelingRow(int delta) {
+    switch (g_leveling_cursor) {
+        case LV_ENABLED: {
+            bool want_on = (delta > 0);
+            if (g_leveling_enabled == want_on) return;
+            activateLevelingRow();  // reuses the toggle path
+            return;
+        }
+        case LV_DRIVE: {
+            int n = g_leveling_drive_db + delta;
+            if (n < 0) n = 0;
+            if (n > LEVELING_DRIVE_DB_MAX) n = LEVELING_DRIVE_DB_MAX;
+            if (n == g_leveling_drive_db) return;
+            g_leveling_drive_db = n;
+            g_out.limiter().setDriveDb((float)g_leveling_drive_db);
+            markStateDirty();
+            break;
+        }
+        case LV_RELEASE: {
+            int n = g_leveling_release_ds + delta;
+            if (n < LEVELING_RELEASE_DS_MIN) n = LEVELING_RELEASE_DS_MIN;
+            if (n > LEVELING_RELEASE_DS_MAX) n = LEVELING_RELEASE_DS_MAX;
+            if (n == g_leveling_release_ds) return;
+            g_leveling_release_ds = n;
+            g_out.limiter().setReleaseSeconds((float)g_leveling_release_ds / 10.0f);
+            markStateDirty();
+            break;
+        }
+        default:  // LV_RESET / LV_BACK — `/` activates, `,` is a no-op
+            if (delta > 0) activateLevelingRow();
+            return;
+    }
+    drawLeveling();
 }
 
 // -- Alarm editor --------------------------------------------------------
@@ -3853,9 +4204,8 @@ static void drawSetTime() {
 }
 
 static void enterSetTime() {
-    // Seed the draft from the live RTC so the user adjusts deltas, not types.
-    rtc_date_type d; g_rtc.getDate(&d);
-    rtc_time_type t; g_rtc.getTime(&t);
+    // Seed the draft from the software clock so the user adjusts deltas, not types.
+    rtc_date_type d; rtc_time_type t; currentClock(d, t);
     g_sct_year  = d.Year;
     g_sct_month = d.Month;
     g_sct_day   = d.Date;
@@ -3885,6 +4235,7 @@ static void commitSetTime() {
     t.Minutes = g_sct_min;
     t.Seconds = 0;
     g_rtc.setTime(&t);
+    syncClockFromRtc();  // re-anchor the software clock to the just-set time
     exitSetTime();
 }
 
@@ -3969,6 +4320,55 @@ static bool parseCompileDateTime(rtc_date_type& d, rtc_time_type& t) {
     return true;
 }
 
+// Civil date <-> days-since-1970 (Howard Hinnant's algorithms). The basis for
+// advancing the software wall-clock across minute / day / month boundaries
+// without per-redraw RTC reads.
+static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void civilFromDays(int64_t z, int& y, unsigned& m, unsigned& d) {
+    z += 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int yr = (int)yoe + (int)(era * 400);
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp + (mp < 10 ? 3 : -9);
+    y = yr + (m <= 2);
+}
+
+// Read the chip and re-anchor the software clock to it. No-op when absent.
+static void syncClockFromRtc() {
+    if (!g_rtc_present) return;
+    rtc_date_type d; g_rtc.getDate(&d);
+    rtc_time_type t; g_rtc.getTime(&t);
+    g_clock_epoch = (uint32_t)(daysFromCivil(d.Year, d.Month, d.Date) * 86400
+                  + t.Hours * 3600 + t.Minutes * 60 + t.Seconds);
+    g_clock_sync_ms = millis();
+}
+
+// Current wall-clock, derived from the last sync plus elapsed millis() — the
+// single source every time consumer reads instead of the chip.
+static void currentClock(rtc_date_type& d, rtc_time_type& t) {
+    uint32_t e = g_clock_epoch + (millis() - g_clock_sync_ms) / 1000;
+    int      y; unsigned m, dd;
+    civilFromDays(e / 86400, y, m, dd);
+    uint32_t secs = e % 86400;
+    d.Year = (uint16_t)y; d.Month = (uint8_t)m; d.Date = (uint8_t)dd;
+    d.WeekDay = dayOfWeekMonFirst(d.Year, d.Month, d.Date);
+    t.Hours = (uint8_t)(secs / 3600);
+    t.Minutes = (uint8_t)((secs % 3600) / 60);
+    t.Seconds = (uint8_t)(secs % 60);
+}
+
 static void seedRtcIfUnset() {
     rtc_date_type d; rtc_time_type t;
     g_rtc.getDate(&d);
@@ -3980,13 +4380,20 @@ static void seedRtcIfUnset() {
                   d.Year, d.Month, d.Date, t.Hours, t.Minutes, t.Seconds);
 }
 
+// Re-sync the software clock from the chip on a slow cadence (drift
+// correction), and once a second refresh the diagnostic clock string and the
+// full-screen clock from the software clock. The chip is touched only on the
+// re-sync, never per second.
+static constexpr uint32_t RTC_RESYNC_MS = 5 * 60 * 1000;  // 5 minutes
+
 static void pollRtcClock() {
-    static uint32_t last_ms = 0;
+    if (!g_rtc_present) return;
+    static uint32_t last_tick = 0, last_sync = 0;
     uint32_t now = millis();
-    if ((uint32_t)(now - last_ms) < 1000) return;
-    last_ms = now;
-    rtc_time_type t;
-    g_rtc.getTime(&t);
+    if ((uint32_t)(now - last_sync) >= RTC_RESYNC_MS) { syncClockFromRtc(); last_sync = now; }
+    if ((uint32_t)(now - last_tick) < 1000) return;
+    last_tick = now;
+    rtc_date_type d; rtc_time_type t; currentClock(d, t);
     snprintf(g_diag_clk, sizeof(g_diag_clk), "%02u:%02u:%02u",
              t.Hours, t.Minutes, t.Seconds);
     if (fullScreenClockActive()) drawClockScreen();
@@ -3997,8 +4404,18 @@ static void setupRtc() {
     // Unit_RTC's 4-arg begin() invokes the Wire slave-mode overload (library
     // bug — TODO: upstream a fix to m5stack/M5Unit-RTC).
     Wire.begin(/*sda=*/2, /*scl=*/1, /*freq=*/100000);
+    // Probe the RTC's I²C address (0x51) once. Everything else gates on
+    // g_rtc_present, so an absent add-on is never spoken to again — no error
+    // storm on the shared bus.
+    Wire.beginTransmission(0x51);
+    g_rtc_present = (Wire.endTransmission() == 0);
+    if (!g_rtc_present) {
+        Serial.println("[rtc] no RTC on Port A — timekeeping and alarms disabled");
+        return;
+    }
     g_rtc.begin(&Wire);
     seedRtcIfUnset();
+    syncClockFromRtc();
 }
 
 // -- Standby clock screen ------------------------------------------------
@@ -4041,8 +4458,8 @@ static uint32_t g_alarm_last_fire_key[ALARM_COUNT] = { 0 };
 // scanning the coming week. Empty string if no alarm is armed. The "next:"
 // label is added by the caller so it can sit on its own line.
 static std::string nextAlarmString() {
-    rtc_date_type d; g_rtc.getDate(&d);
-    rtc_time_type t; g_rtc.getTime(&t);
+    if (!g_rtc_present) return {};
+    rtc_date_type d; rtc_time_type t; currentClock(d, t);
     uint8_t today_dow = dayOfWeekMonFirst(d.Year, d.Month, d.Date);
     int now_min = t.Hours * 60 + t.Minutes;
     int best_offset_min = INT_MAX;
@@ -4105,9 +4522,6 @@ static void drawClockSubtext(const char* text, int top, int size, uint16_t col) 
 static void drawClockScreen() {
     auto& d = g_canvas;
     d.fillScreen(BLACK);
-    rtc_date_type rd; g_rtc.getDate(&rd);
-    rtc_time_type rt; g_rtc.getTime(&rt);
-    uint8_t dow = dayOfWeekMonFirst(rd.Year, rd.Month, rd.Date);
 
     // Warm, bright palette (high red + green, no blue): legible at low standby
     // brightness so the user needn't raise the backlight, while keeping blue
@@ -4117,19 +4531,37 @@ static void drawClockScreen() {
     constexpr uint16_t COL_CLOCK_ALERT     = 0xFB00;  // deep orange — fire / snooze
     constexpr uint16_t COL_CLOCK_FIRING    = 0xFFFF;  // white — the time while the alarm sounds
 
-    // Status strip: today's weekday top-left and battery top-right, matched
-    // in colour and size so they read as a pair.
+    // Battery top-right — shown in both the clock and the no-clock states.
+    if (g_battery_level >= 0) {
+        char bat[10];
+        snprintf(bat, sizeof(bat), "bat %d%%", g_battery_level);
+        d.setTextSize(2);
+        d.setTextColor(COL_CLOCK_SECONDARY, BLACK);
+        d.setCursor(SCREEN_W - (int)strlen(bat) * 12 - 2, 2);
+        d.print(bat);
+    }
+
+    // No RTC fitted: no timekeeping, so say so plainly rather than show a wrong
+    // time. Alarms are disabled too, so only standby reaches here.
+    if (!g_rtc_present) {
+        const char* nc = "no clock";
+        d.setTextSize(4);
+        d.setTextColor(COL_WARN, BLACK);
+        d.setCursor((SCREEN_W - (int)strlen(nc) * 24) / 2, 44);
+        d.print(nc);
+        drawClockSubtext("RTC not connected", 100, 2, COL_WARN);
+        presentFrame();
+        return;
+    }
+
+    rtc_date_type rd; rtc_time_type rt; currentClock(rd, rt);
+    uint8_t dow = dayOfWeekMonFirst(rd.Year, rd.Month, rd.Date);
+
+    // Status strip: today's weekday top-left, matched to the battery above.
     d.setTextSize(2);
     d.setTextColor(COL_CLOCK_SECONDARY, BLACK);
     d.setCursor(2, 2);
     d.print(WEEKDAY_NAMES[dow]);
-    if (g_battery_level >= 0) {
-        char bat[10];
-        snprintf(bat, sizeof(bat), "bat %d%%", g_battery_level);
-        int bw = (int)strlen(bat) * 12;
-        d.setCursor(SCREEN_W - bw - 2, 2);
-        d.print(bat);
-    }
 
     // Big HH:MM centred — size 7 → 42 px char width × 56 px tall.
     // Firing turns the time white as an unmistakable "alarm is live" cue;
@@ -4186,6 +4618,7 @@ static void renderScreen() {
         case Screen::KeyReference:  drawHelp();        break;
         case Screen::ResetModal:    drawResetModal();  break;
         case Screen::Alarms:        drawAlarms();      break;
+        case Screen::Leveling:      drawLeveling();    break;
         case Screen::SetTime:       drawSetTime();     break;
         case Screen::AlarmEditor:   drawAlarmEditor(); break;
         case Screen::DaysEditor:    drawDaysEditor();  break;
@@ -4193,6 +4626,7 @@ static void renderScreen() {
         case Screen::AlarmFiring:
         case Screen::AlarmSnoozing: drawClockScreen(); break;
         case Screen::Chess:         chess::render(g_canvas); presentFrame(); break;
+        case Screen::ChessConfirm:  drawChessConfirm(); break;
         case Screen::Main:
         case Screen::TrackPicker:   draw();            break;
     }
@@ -4439,8 +4873,8 @@ static void pollAlarms() {
         return;
     }
 
-    rtc_date_type d; g_rtc.getDate(&d);
-    rtc_time_type t; g_rtc.getTime(&t);
+    if (!g_rtc_present) return;  // no clock → alarms never arm or fire
+    rtc_date_type d; rtc_time_type t; currentClock(d, t);
     uint8_t dow = dayOfWeekMonFirst(d.Year, d.Month, d.Date);
     uint32_t key = ((uint32_t)d.Year * 10000u + (uint32_t)d.Month * 100u + d.Date) * 10000u
                  + (uint32_t)t.Hours * 100u + t.Minutes;
@@ -4584,6 +5018,7 @@ void setup() {
     }
 
     applyVolume();
+    applyLeveling();
 
     g_audio_mutex   = xSemaphoreCreateMutex();
     g_display_mutex = xSemaphoreCreateMutex();
@@ -4662,6 +5097,7 @@ void loop() {
     pollAlarms();
     pollIdleScreen();
     pollBrightnessRamp();
+    pollHeapDiag();
     fuzzyHarnessPoll();
 
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
@@ -4726,8 +5162,9 @@ void loop() {
                     if      (c == 'W' || c == 'w') toggleWaveform();
                     else if (c == 'S' || c == 's') toggleSpectrum();
                     else if (c == 'T' || c == 't') toggleTestPattern();
-                    else if (c == 'H' || c == 'h') enterChess();
+                    else if (c == 'H' || c == 'h') requestChess();
                     else if (c == 'D' || c == 'd') toggleDiagnostics();
+                    else if (c == 'L' || c == 'l') toggleLeveling();
                     else if (c == '?')             showSettings();   // Ctrl+/
                 }
             }
@@ -4773,6 +5210,15 @@ void loop() {
                 exitChess();
             } else {
                 draw();
+            }
+        } else if (g_screen == Screen::ChessConfirm) {
+            // Enter confirms (pause playback, free memory, open chess); any
+            // other key cancels back to the browser. `` ` `` cancels via the
+            // pre-pass (backOut → Main).
+            if (state.enter) {
+                enterChessFreeingAudio();
+            } else if (!state.word.empty() || state.del || state.space) {
+                goToScreen(Screen::Main);
             }
         } else if (g_screen == Screen::ResetModal) {
             // `/` confirms the destructive action; any other key — letter,
@@ -4856,8 +5302,11 @@ void loop() {
             }
         } else if (g_screen == Screen::Alarms) {
             // Alarms screen: same nav idiom as Settings, plus Enter as a
-            // sub-menu activator and Del as an explicit back.
-            if (state.enter) {
+            // sub-menu activator and Del as an explicit back. With no RTC the
+            // screen is a bare warning — only Del / `` ` `` (pre-pass) exit.
+            if (!g_rtc_present) {
+                if (state.del) exitAlarms();
+            } else if (state.enter) {
                 activateAlarmsRow();
             } else if (state.del) {
                 exitAlarms();
@@ -4867,6 +5316,20 @@ void loop() {
                     else if (c == '.') moveAlarmsCursor(+1);
                     else if (c == ',') adjustAlarmsRow(-1);
                     else if (c == '/') adjustAlarmsRow(+1);
+                }
+            }
+        } else if (g_screen == Screen::Leveling) {
+            // Leveling sub-menu: same nav idiom as Alarms.
+            if (state.enter) {
+                activateLevelingRow();
+            } else if (state.del) {
+                exitLeveling();
+            } else {
+                for (char c : state.word) {
+                    if      (c == ';') moveLevelingCursor(-1);
+                    else if (c == '.') moveLevelingCursor(+1);
+                    else if (c == ',') adjustLevelingRow(-1);
+                    else if (c == '/') adjustLevelingRow(+1);
                 }
             }
         } else if (g_screen == Screen::Settings) {

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.25.10 — 2026-06-03
+
+- Fixed larger FLAC files (notably stereo audiobooks) failing to play — they would load and immediately skip to the next track. The chess feature was permanently reserving 24 KB of memory even when unused, leaving the audio decoder too little to work with; that scratchpad is now claimed only while chess is open. Opening chess while a track is playing now asks to confirm, since it pauses playback to free memory for the chess AI; leaving chess reloads the track paused where you left off, ready to un-pause.
+
+## 0.25.6 — 2026-06-02
+
+- Graceful handling of a missing RTC. A unit without the Port-A real-time-clock add-on no longer floods the log with I²C errors: the RTC is detected once at boot and, when absent, left alone. Timekeeping runs from a software clock that reads the chip only every few minutes (and at boot / when you set the time) rather than on every redraw. With no RTC fitted, the standby screen shows "no clock" and the alarms menu shows alarms are unavailable — both in warning orange — instead of a wrong time.
+
+## 0.25.4 — 2026-06-02
+
+- Loudness leveling. Optional on-the-fly levelling that lifts quiet passages and tames loud ones, so an audiobook can be listened to at a fixed volume in a quiet room. A fixed drive gain pushes quiet material up while a lookahead brickwall limiter catches the peaks, with an adjustable slow release. Off by default; toggle with `Ctrl+L` or in Settings → Leveling, where Drive gain (0…+24 dB), Release (0.1…2.0 s), and Reset to default live. While on during playback the footer progress bar turns amber, and the waveform carries an amber trace showing how much the sound is being amplified moment to moment.
+
 ## 0.24.12 — 2026-06-02
 
 - Alarm tweaks. While an alarm sounds the clock time turns white. Enter dismisses the alarm but leaves the track playing to its natural end; from snooze, Enter restarts the alarm track from the top. `` ` `` (Esc) stops and returns to the previous track, paused. The clock time no longer shifts position between the standby, firing, and snooze screens.

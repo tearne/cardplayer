@@ -6,6 +6,7 @@
 [Down](#standby-clock)
 [Down](#playback)
 [Down](#controls-and-navigation)
+[Down](#diagnostics)
 [Down](#screen-idle)
 [Down](#persisted-state)
 
@@ -17,9 +18,8 @@ Application
 │ ├ Header
 │ │ ├ Version
 │ │ ├ Path Breadcrumb
-│ │ ├ Battery
-│ │ │ └ Emergency Shutdown
-│ │ └ Diagnostics
+│ │ └ Battery
+│ │   └ Emergency Shutdown
 │ ├ Footer
 │ ├ Browser
 │ │ └ Fuzzy Search
@@ -40,6 +40,9 @@ Application
 ├ Playback
 │ └ Audio Formats
 ├ Controls and Navigation
+├ Diagnostics
+│ ├ On-screen Diagnostics
+│ └ Console Diagnostics
 ├ Screen Idle (unreviewed)
 └ Persisted State
 ```
@@ -62,11 +65,14 @@ Esc (`` ` ``) on any other screen backs out one level toward Main; pressing it a
 [Down](#version)
 [Down](#path-breadcrumb)
 [Down](#battery)
-[Down](#diagnostics)
 
-A strip at the top of the display, 42 px tall when diagnostics are shown, collapsing to 10 px when hidden. The first row carries the battery readout on the left and either the version string or the path breadcrumb on the right. The second row carries the diagnostics readouts; the CPU sparkline within them spans the full header height in its right-side region, drawing over the path/version slot when sparkline pixels reach that high.
+A strip at the top of the display, 42 px tall when the diagnostics row is shown, collapsing to 10 px when hidden. The first row carries the battery readout on the left and either the version string or the path breadcrumb on the right. The second row, when shown, carries the [On-screen Diagnostics](#on-screen-diagnostics) readouts; the CPU sparkline within them spans the full header height in its right-side region, drawing over the path/version slot when sparkline pixels reach that high.
 
 While the fuzzy-search index is rebuilding (background, at boot or manually triggered), a one-character spinner cycles in the top-right cell and the version / breadcrumb slot shrinks by one char to make room.
+
+**See also**
+
+- [On-screen Diagnostics](#on-screen-diagnostics) — the optional second row this strip expands to show.
 
 # Version
 
@@ -132,12 +138,20 @@ When the cell hits the empty cutoff, the device protects itself by powering off 
 
 # Diagnostics
 
-[Up](#header)
+[Up](#application)
+[Down](#on-screen-diagnostics)
+[Down](#console-diagnostics)
+
+Device-resource and memory readouts for development, surfaced two ways: [On-screen](#on-screen-diagnostics) as an optional header row, and over the [Console](#console-diagnostics) on the USB serial port.
+
+# On-screen Diagnostics
+
+[Up](#diagnostics)
 
 > [!WARNING]
 > Unreviewed.
 
-Second row of the header, showing live device-resource readouts useful during development. Hidden by default; toggle with `Ctrl+D`.
+Live device-resource readouts shown as the [Header](#header)'s second row. Hidden by default; toggle with `Ctrl+D`.
 
 **Detail**
 
@@ -156,6 +170,26 @@ Second row of the header, showing live device-resource readouts useful during de
 - **im** — last IMU motion-delta magnitude in milligrams. Compare against the 50 mg threshold that triggers `markActivity`.
 
 - **c0 / c1** — per-core load as a percentage; the sparkline (cyan core 0, orange core 1) holds ~37 s of history.
+
+**See also**
+
+- [Header](#header) — the strip this row lives in.
+
+# Console Diagnostics
+
+[Up](#diagnostics)
+
+Developer readouts over the USB serial console — no on-screen UI, present in every build.
+
+**Detail**
+
+- **`h` keypress** — prints a one-shot heap census: free bytes and the largest contiguous block, broken down by capability (default / internal / DMA). The largest-block figure is what gates a big allocation like the FLAC decoder's per-frame buffers, so a large free total with a small largest block signals fragmentation.
+
+- **Track-load failure line** — the `loop fail:` log carries `largest=` alongside free heap, so a memory-starved load is distinguishable from other decode failures.
+
+**See also**
+
+- [Audio Formats](#audio-formats) — the FLAC decoder's per-frame allocation is the main consumer these figures track.
 
 # Browser
 
@@ -251,7 +285,7 @@ Most keys mean something specific to the **current screen**; a few are **global*
 
 - **Global (every screen)** — `` ` `` (Esc) backs out one level — or, at the [Main](#main) root, opens the [Standby Clock](#standby-clock) — and the transport/display keys (pause, volume, skip, seek, brightness) stay live so playback is always controllable. They yield only while typing in search or at a confirmation modal.
 - **Per screen** — the arrow cluster `;` `.` `,` `/` (the keyboard's up / down / left / right) navigates and activates: up/down move the cursor, left steps out, right enters or adjusts — the exact effect depends on the screen. `Enter` and `Del` are likewise screen-local; letters and digits type into [Fuzzy Search](#fuzzy-search) or chess.
-- **From [Main](#main)** — `Ctrl`-combos open the other screens: `Ctrl+/` [Settings](#settings), `Ctrl+W`/`S` [Visualisation](#visualisation), `Ctrl+H` [Chess](#chess), `Ctrl+D` [Diagnostics](#diagnostics).
+- **From [Main](#main)** — `Ctrl`-combos open the other screens: `Ctrl+/` [Settings](#settings), `Ctrl+W`/`S` [Visualisation](#visualisation), `Ctrl+H` [Chess](#chess), `Ctrl+D` [On-screen Diagnostics](#on-screen-diagnostics).
 
 Esc backs out along the edges of the screen tree, toward Main:
 
@@ -362,14 +396,15 @@ A warm, low-blue palette keeps it legible at night without raising the backlight
 
 [Up](#standby-clock)
 
-A system interrupt, not a navigable screen: an armed alarm pre-empts whatever is on screen, takes over with the wake clock at normal brightness, and plays. Any key snoozes for 8 minutes (a countdown badge shows on the clock); `` ` `` (Esc) or Enter dismisses; it auto-stops after one cumulative hour. Dismiss restores the pre-alarm state — the track that was playing, its position, and the volume.
+A system interrupt, not a navigable screen: an armed alarm pre-empts whatever is on screen and takes over with the wake clock at normal brightness — the time turns white as a sounding-alarm cue — playing the slot's track. Three ways out: `` ` `` (Esc) silences the alarm and returns to the pre-alarm track at its position but paused; Enter wakes to the music, dismissing the alarm yet leaving its track playing; any other key snoozes for 8 minutes (a countdown badge shows on the clock). It auto-stops after one cumulative hour, like Esc.
 
 Up to five alarms are configured under Settings → [Alarms](#alarms); each fires on its chosen days at its time, playing its track at its volume (with an optional fade-in ramp), or a built-in beep if the track can't be opened.
 
 **Detail**
 
 - Polled once a second against the current minute and weekday; a per-slot watermark prevents re-firing within the same minute.
-- The chosen track loops until dismissed; snooze pauses it and re-fire restarts it.
+- While sounding, the slot's track loops. Snooze pauses it and auto-re-fires after 8 minutes; Enter from snooze wakes by restarting the track from the top.
+- The Esc / auto-stop restore also brings back the pre-alarm volume; the Enter wake keeps the alarm's volume.
 
 # Persisted State
 
@@ -506,9 +541,9 @@ Three states: **FULL** (user-set brightness), **FADING** (linear ramp toward zer
 
 - `Ctrl+-` / `Ctrl+=` step brightness globally (context-sensitive — see [Controls and Navigation](#controls-and-navigation)); the brightness ramp on user change is 200 ms (responsive without feeling abrupt).
 
-- The [Diagnostics](#diagnostics) row's `to` readout shows the seconds until the fade fires, for debugging idle behaviour.
+- The [On-screen Diagnostics](#on-screen-diagnostics) row's `to` readout shows the seconds until the fade fires, for debugging idle behaviour.
 
 **See also**
 
 - [Settings](#settings) — Backlight off and Brightness rows live here
-- [Diagnostics](#diagnostics) — `to` / `im` readouts
+- [On-screen Diagnostics](#on-screen-diagnostics) — `to` / `im` readouts

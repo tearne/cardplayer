@@ -14,6 +14,8 @@
 
 #include <arduinoFFT.h>
 
+#include "loudness_limiter.h"
+
 // Spectrum tap — 256-pt real FFT once per 256 incoming mono samples.
 // Magnitudes log-grouped into SPEC_BINS visible bands and accumulated into
 // the in-progress display column. Column commits at SPEC_COL_SAMPLES
@@ -63,8 +65,17 @@ static constexpr int WV_COLS = 256;
 struct WaveformRing {
     int8_t  min_v[WV_COLS] = {};
     int8_t  max_v[WV_COLS] = {};
+    // Per-column loudness-leveling amplification: the lowest net gain seen in
+    // the column (so a tamed peak shows as a dip), mapped to 0..255 over
+    // 0..+24 dB. Only meaningful while leveling is on; the render path draws
+    // it as a trace over the top of the waveform.
+    uint8_t amp[WV_COLS]   = {};
     volatile uint32_t head = 0;  // next column to write (modular index)
 };
+
+// Net-gain (dB) → byte mapping for WaveformRing::amp, shared by the writer
+// here and the trace renderer in main.cpp.
+static constexpr float WV_AMP_MAX_DB = 24.0f;
 
 class AudioOutputM5CardputerSpeaker : public AudioOutput {
 public:
@@ -75,6 +86,10 @@ public:
 
     const WaveformRing& waveformRing() const { return _wv; }
     const SpectrumRing& spectrumRing() const { return _spec; }
+
+    // Loudness leveling stage. UI task drives it through the setters; the
+    // audio task reads it per-sample inside ConsumeSample.
+    LoudnessLimiter& limiter() { return _limiter; }
 
     // One-time FFT init. Safe to call before begin(); idempotent.
     void initSpectrum() {
@@ -96,6 +111,7 @@ public:
 
     bool SetChannels(int chan) override {
         bool result = AudioOutput::SetChannels(chan);
+        _limiter.setSampleRate(sampleRate());
         if (_log_pending) {
             Serial.printf("format: rate=%u bits=%u ch=%u\n", hertz, bps, channels);
             _log_pending = false;
@@ -120,6 +136,10 @@ public:
             int32_t sum = (int32_t)sample[0] + (int32_t)sample[1];
             mono = (int16_t)(sum / 2);
         }
+        // Level before the visualisation taps and pre-buffer store, so the
+        // overlays show what you actually hear and leveling sits ahead of the
+        // codec's own volume control. No-op while leveling is off.
+        mono = _limiter.process(mono);
         _prebuf[_prebuf_head] = mono;
         _prebuf_head = (_prebuf_head + 1) % PREBUF_SAMPLES;
         _prebuf_count++;
@@ -129,6 +149,10 @@ public:
         // pre-buffer ingress (= deepest available future).
         if (mono < _wv_min) _wv_min = mono;
         if (mono > _wv_max) _wv_max = mono;
+        // Track the lowest net gain in this column so the amplification trace
+        // dips on tamed peaks. Read after process() so it reflects this sample.
+        float ng = _limiter.netGain();
+        if (ng < _amp_min) _amp_min = ng;
         // Visualisation taps (waveform + spectrum) are suppressed for a
         // window after resetVisualisation so the decoder's pre-seek
         // sample pipeline drains without contaminating either ring.
@@ -143,9 +167,14 @@ public:
             uint32_t h = _wv.head;
             _wv.min_v[h] = (int8_t)(_wv_min >> 8);
             _wv.max_v[h] = (int8_t)(_wv_max >> 8);
+            float ndb = 20.0f * log10f(_amp_min > 1e-6f ? _amp_min : 1e-6f);
+            if (ndb < 0.0f)            ndb = 0.0f;
+            if (ndb > WV_AMP_MAX_DB)   ndb = WV_AMP_MAX_DB;
+            _wv.amp[h] = (uint8_t)(ndb * (255.0f / WV_AMP_MAX_DB) + 0.5f);
             _wv.head = (h + 1) % WV_COLS;
             _wv_min = INT16_MAX;
             _wv_max = INT16_MIN;
+            _amp_min = AMP_MIN_INIT;
             _wv_count = 0;
         }
 
@@ -200,6 +229,7 @@ public:
         _prebuf_head  = 0;
         _prebuf_tail  = 0;
         _prebuf_count = 0;
+        _limiter.reset();  // drop the lookahead delay line and gain envelope
         // Visualisation rings deliberately left intact — the on-screen
         // spectrum / waveform scrolls continuously across jumps. Call
         // `resetVisualisation` separately if a true blank is desired.
@@ -215,8 +245,10 @@ public:
     void resetVisualisation() {
         memset(_wv.min_v, 0, sizeof(_wv.min_v));
         memset(_wv.max_v, 0, sizeof(_wv.max_v));
+        memset(_wv.amp,   0, sizeof(_wv.amp));
         _wv_min = INT16_MAX;
         _wv_max = INT16_MIN;
+        _amp_min = AMP_MIN_INIT;
         _wv_count = 0;
         memset(_spec.intensity, 0, sizeof(_spec.intensity));
         for (int b = 0; b < SPEC_BINS; b++) _spec_accum[b] = 0.0f;
@@ -351,7 +383,13 @@ private:
     int16_t  _wv_min = INT16_MAX;
     int16_t  _wv_max = INT16_MIN;
     int      _wv_count = 0;
+    // Per-column min net gain accumulator; reset to a value above any real
+    // net gain so the first sample wins the min.
+    static constexpr float AMP_MIN_INIT = 1e9f;
+    float    _amp_min = AMP_MIN_INIT;
     uint32_t _samples_consumed = 0;  // reset on resetFormatLog()
+
+    LoudnessLimiter _limiter {};
 
     // Spectrum tap state.
     SpectrumRing _spec {};

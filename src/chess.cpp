@@ -8,6 +8,7 @@
 
 #include <Preferences.h>
 #include <esp_random.h>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -567,7 +568,11 @@ static constexpr uint32_t DEADLINE_CHECK_INTERVAL = 1024; // must be power of tw
 static constexpr int      MATE_SCORE              = 30000;
 static constexpr int      INF_SCORE               = 1 << 30;
 
-static Move     g_move_stack[MAX_PLY][MAX_MOVES];
+// Per-ply pseudo-legal move scratch for the search (~24 KB). Heap-allocated
+// only while chess is active rather than permanently static, so it doesn't
+// reserve memory the audio decoder needs during playback. The host pauses /
+// frees audio before entering chess, so there's room to allocate it.
+static Move   (*g_move_stack)[MAX_MOVES] = nullptr;  // [MAX_PLY][MAX_MOVES]
 static uint32_t g_search_deadline_ms = 0;
 static uint64_t g_search_nodes       = 0;
 static bool     g_search_aborted     = false;
@@ -695,6 +700,7 @@ static Move searchBestMove(Position& p) {
     Move best{ -1, -1, 0, 0 };
     if (root_count == 0) return best;
     best = root_moves[0];
+    if (!g_move_stack) return best;  // scratchpad unavailable — play first legal move
 
     int pv_from = -1, pv_to = -1;
     int last_complete_count = 0;
@@ -1154,11 +1160,18 @@ void enter() {
     g_cursor_f = 4;
     g_cursor_r = 0;
     g_active = true;
+    // Claim the search scratchpad now (host has freed audio first). If it
+    // somehow fails, searchBestMove falls back to a first-legal-move.
+    if (!g_move_stack) {
+        g_move_stack = (Move(*)[MAX_MOVES])malloc(sizeof(Move) * MAX_PLY * MAX_MOVES);
+    }
 }
 
 void exit() {
     g_active = false;
     save();
+    free(g_move_stack);
+    g_move_stack = nullptr;
 }
 
 bool active() { return g_active; }
