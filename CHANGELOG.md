@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.26.27 — 2026-06-04
+
+- Footer rework. The track name now gets most of the footer width. Volume moves to a slim borderless vertical cyan bar with its number to the right; track position is a thin 2 px red line behind the name (replacing the old horizontal progress bar). A new transport icon at the far left always shows playback state by shape — ▶ playing, ❚❚ paused, ■ stopped — and turns from green to amber while leveling is on, replacing the separate leveling "knee" icon.
+
+## 0.26.5 — 2026-06-03
+
+- UI colour refresh and tidier menus. The header battery voltage, the volume bar/number, and the paused/idle progress bar now share a brighter blue; the progress bar turns green while playing (amber while leveling is on). The redundant "Back" row is gone from the Leveling, Alarms, Alarm Editor and Set Current Time menus — Esc or Del backs out.
+
 ## 0.26.1 — 2026-06-03
 
 - Loudness leveling: fixed the distortion on loud passages. The limiter now pulls the gain down fast enough ahead of peaks that they meet the ceiling smoothly instead of clipping. Settings → Leveling gains full control — Drive gain, Release, Attack, Lookahead, and Ceiling — and the default drive is raised to +12 dB. The amplification trace over the waveform now scales to the drive setting, so its movement (the limiter working) is clearly visible.

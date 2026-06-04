@@ -272,10 +272,15 @@ Scrolling FFT spectrogram — each new column encodes the magnitude of frequency
 
 [Up](#main)
 
-> [!WARNING]
-> Unreviewed.
+A thin strip along the bottom, always visible — independent of what the browser is showing and of any diagnostics-row toggle. Left to right: a transport icon, the playing track's name (marquee-scrolling when it overflows its slot), and on the right a volume bar with its numeric level. Track position is shown not by a bar but by a thin red line riding left→right behind the name.
 
-A thin strip at the bottom of the display carrying — left to right — the playing track's name (marquee-scrolling when longer than its slot), a progress bar, and a volume bar. The volume bar fills relative to the [Settings](#settings) "Volume max" cap, so a full bar reads as "at your chosen ceiling" rather than the hardware ceiling. The progress bar doubles as the play/pause indicator: slate-blue while playing, mid-grey while paused or stopped. The hairline framing the top of the strip is the same slate-blue as the progress bar so the footer reads as a distinct region. Always visible, independent of what the browser is showing and of any diagnostics-row toggle. When nothing is playing, the name slot shows "stopped".
+The transport icon carries two things at once: playback state by *shape* — triangle playing, two bars paused, square stopped — and loudness-leveling on/off by *colour*, green off, amber on. When nothing is playing the name reads "stopped" and the icon is the square.
+
+The volume bar is a slim vertical column filling bottom→top, sized relative to the [Settings](#settings) "Volume max" cap — a full bar reads as "at your chosen ceiling" rather than the hardware ceiling.
+
+**Detail**
+
+Palette: track name and [Battery](#battery) voltage blue, volume bar and number cyan, progress line red, transport icon green/amber. The progress line and volume bar each stay within the name's text region — never overlapping each other or the icon. A hairline frames the top of the strip so the footer reads as a distinct region.
 
 # Controls and Navigation
 

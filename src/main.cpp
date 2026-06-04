@@ -31,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.26.1";
+static constexpr const char* APP_VERSION = "0.26.27";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -66,16 +66,23 @@ static constexpr int DIAG_GRAPH_Y     = 0;                                  // f
 static constexpr int DIAG_GRAPH_W     = SCREEN_W - DIAG_GRAPH_X;            // 148
 static constexpr int DIAG_GRAPH_H     = HEADER_FULL_H;                      // 42
 
-// Footer slots — left to right within the footer band (see footerH).
-// Play/pause state is conveyed by the progress bar's colour (slate-blue while
-// playing, grey while paused or stopped) rather than a dedicated indicator.
+// Footer text row — track name on the left (taking most of the width), volume
+// on the right. The volume level is a narrow vertical bar (fills bottom→top)
+// with the two-char number to its right; the slim bar leaves more room for the
+// name than the old horizontal bar did. Track progress is the line behind the
+// name (see drawProgressMarker).
+static constexpr int FOOTER_VBAR_W = 5;                                  // vertical volume bar width
+static constexpr int FOOTER_PROGRESS_W = 2;                              // progress line width
+static constexpr int FOOTER_VNUM_W = 2 * 6 + 1;                          // "NN" at BASE_CHAR_W=6 + 1 px gap
+static constexpr int FOOTER_VOL_W  = FOOTER_VBAR_W + 2 + FOOTER_VNUM_W;  // bar + gap + number = 20
+static constexpr int FOOTER_VOL_X  = SCREEN_W - FOOTER_VOL_W - 1;        // 219
 static constexpr int FOOTER_NAME_X = 1;
-static constexpr int FOOTER_NAME_W = 106;
-static constexpr int FOOTER_PROG_X = FOOTER_NAME_X + FOOTER_NAME_W + 2;  // 109
-static constexpr int FOOTER_PROG_W = 96;
-static constexpr int FOOTER_VOL_X  = FOOTER_PROG_X + FOOTER_PROG_W + 2;  // 207
-static constexpr int FOOTER_VOL_W  = SCREEN_W - FOOTER_VOL_X - 1;        // 32
-static constexpr int FOOTER_BAR_H  = 6;
+static constexpr int FOOTER_NAME_W = FOOTER_VOL_X - 2 - FOOTER_NAME_X;   // 216
+// Transport icon at the far left (always shown): play/pause/stop by shape,
+// leveling on/off by colour. The track name always indents past it by
+// FOOTER_ICON_SLOT.
+static constexpr int FOOTER_ICON_W    = 8;
+static constexpr int FOOTER_ICON_SLOT = FOOTER_ICON_W + 3;  // icon + gap before the name
 
 static constexpr uint32_t AUDIO_TASK_STACK    = 6 * 1024;
 static constexpr UBaseType_t AUDIO_TASK_PRIO  = 3;
@@ -167,14 +174,23 @@ static constexpr uint16_t COL_SEARCH_SEL_BG = 0x0240;
 static constexpr uint16_t COL_SEARCH_PROMPT = 0x4FE0;
 static constexpr uint16_t COL_HAIRLINE   = 0x4208;  // mid grey for column dividers
 static constexpr uint16_t COL_HEADER_TXT = 0x7BEF;
+// Brightened blue accent, shared by the battery voltage, the volume bar/number,
+// and the idle/paused (standby) progress bar. Lifted from the deep slate-blue
+// for legibility while staying in that blue family; distinct from the white path.
+static constexpr uint16_t COL_ACCENT_BLUE = 0x83BF;
 // Brighter mid-grey for the diagnostics numerics. 0x7BEF reads as too
 // dim against the black header at the small (6 px) font size. Matches
 // COL_FILE_NORMAL — clearly visible secondary text.
 static constexpr uint16_t COL_DIAG_TXT   = 0xC618;
-static constexpr uint16_t COL_FOOTER_TXT   = 0xFFFF;  // track name
-static constexpr uint16_t COL_FOOTER_PROG  = 0x6979;  // progress bar while playing (slate-blue)
-static constexpr uint16_t COL_FOOTER_IDLE  = 0x7BEF;  // progress bar while paused or stopped (mid-grey)
-static constexpr uint16_t COL_FOOTER_VOL   = 0x34D0;  // volume bar (muted teal)
+static constexpr uint16_t COL_FOOTER_TXT   = COL_ACCENT_BLUE;  // track name (blue, matches volume + battery)
+// Amber, shared by the progress line and the leveling icon. The line is always
+// this colour (hue is indistinguishable at 1 px wide, so play-state isn't shown
+// on it); leveling is signalled by the icon's presence instead.
+static constexpr uint16_t COL_MARKER = 0xFD20;  // amber
+static constexpr uint16_t COL_PROGRESS = 0xA800;  // progress line (medium red, not too bright)
+static constexpr uint16_t COL_FOOTER_ICON = 0x05E0;  // transport icon, normal (green ~75%); amber COL_MARKER while leveling
+static constexpr uint16_t COL_FOOTER_VOL   = 0x05F7;  // volume bar + number (cyan, ~75%)
+static constexpr uint16_t COL_WAVEFORM     = 0x6979;  // waveform trace (slate-blue)
 // Loudness-leveling accent (footer "L" + amplification trace). Warm amber so
 // it reads clearly both over the cool slate-blue waveform and against black.
 static constexpr uint16_t COL_LEVEL_ACCENT = 0xFD20;  // amber-orange
@@ -449,10 +465,17 @@ static inline int notchSize() { return FONT_NOTCHES[g_font_notch].text_size; }
 static inline int rowH()      { return FONT_NOTCHES[g_font_notch].row_h; }
 static inline int charW()     { return FONT_NOTCHES[g_font_notch].char_w; }
 static inline int headerH()  { return g_diagnostics_hidden ? HEADER_MIN_H : HEADER_FULL_H; }
+// Footer: a single 10 px row carrying the track name (left) and volume
+// (right). Track progress is a 1 px vertical line at the play position, from
+// the separator down to the bottom of the screen, drawn behind the text.
 static inline int footerH()  { return 10; }
 static inline int browserY() { return headerH(); }
 static inline int browserH() { return SCREEN_H - headerH() - footerH(); }
 static inline int footerY()  { return headerH() + browserH(); }
+// Footer's full redraw region includes the separator row one px above the
+// band, where the progress line starts.
+static inline int footerDrawY() { return footerY() - 1; }
+static inline int footerDrawH() { return footerH() + 1; }
 // Frame colour follows the active browse context (see COL_PICK_FRAME).
 static inline uint16_t browseFrameColor() { return (g_pick_slot >= 0) ? COL_PICK_FRAME : COL_BROWSE_FRAME; }
 
@@ -1180,6 +1203,7 @@ static void drawHeaderToCanvas() {
 
     constexpr int VOLT_W = 5 * BASE_CHAR_W;
     int volt_x = BATTERY_ICON_X + ICON_W + 2 + 2;  // icon + nub + gap
+    d.setTextColor(COL_ACCENT_BLUE, BLACK);  // brightened blue, legible and in-palette
     d.setCursor(volt_x, 1);
     d.printf("%d.%02dv",
              g_battery_voltage_mv / 1000,
@@ -1725,87 +1749,101 @@ static void pollBattery(bool force = false) {
 }
 
 // Footer text always renders at size 1 with the default Font0, regardless of
-// the browser's font notch — the footer band is fixed-height.
+// the browser's font notch. Transparent background so it overlays the progress
+// marker rather than boxing it out with opaque glyph cells.
 static inline void setFooterText(uint16_t fg) {
     auto& d = g_canvas;
     d.setFont(&fonts::Font0);
     d.setTextSize(1);
     d.setTextWrap(false, false);
-    d.setTextColor(fg, BLACK);
+    d.setTextColor(fg);
+}
+
+// Track progress: a 2 px red vertical line at the play position, from the
+// separator down to the bottom of the screen. Drawn behind everything else in
+// the footer (separator and text draw over it). composeFooter owns the clear.
+static void drawProgressMarker() {
+    if (g_play_path.empty() || !g_src) return;
+    uint32_t pos = g_src->getPos();
+    uint32_t sz  = g_src->getSize();
+    if (sz == 0) return;
+    // Span exactly the text region: start where the name starts (past the
+    // leveling icon when it's shown), end at the text-area end — never under the
+    // volume, never under the icon.
+    int left   = FOOTER_NAME_X + FOOTER_ICON_SLOT;  // past the always-present transport icon
+    int width  = FOOTER_NAME_W - FOOTER_ICON_SLOT;
+    int x = left + (int)((uint64_t)pos * width / sz);
+    if (x > left + width - FOOTER_PROGRESS_W) x = left + width - FOOTER_PROGRESS_W;  // keep the full width in-span
+    g_canvas.fillRect(x, footerY() - 1, FOOTER_PROGRESS_W, footerH() + 1, COL_PROGRESS);
+}
+
+// Transport indicator at the far left of the footer, always shown. Shape gives
+// the playback state — right triangle playing, two bars paused, square stopped
+// (no track loaded). Colour gives leveling: green normally, amber while on.
+static void drawTransportIcon() {
+    auto& d = g_canvas;
+    int s  = FOOTER_ICON_W - 2;  // glyph a touch smaller than its slot
+    int x0 = FOOTER_NAME_X + (FOOTER_ICON_W - s) / 2;  // centred in the slot
+    int y0 = footerY() + (footerH() - s) / 2;
+    uint16_t col = g_leveling_enabled ? COL_MARKER : COL_FOOTER_ICON;
+    if (g_play_path.empty()) {
+        d.fillRect(x0, y0, s, s, col);                                  // stopped
+    } else if (g_paused) {
+        int bw = (s + 1) / 3, gap = s - 2 * bw;                         // paused — two bars
+        d.fillRect(x0, y0, bw, s, col);
+        d.fillRect(x0 + bw + gap, y0, bw, s, col);
+    } else {
+        d.fillTriangle(x0, y0, x0, y0 + s - 1, x0 + s - 1, y0 + s / 2, col);  // playing
+    }
 }
 
 static void drawSlotName() {
     auto& d = g_canvas;
     int fy = footerY();
     int fh = footerH();
-    d.fillRect(FOOTER_NAME_X, fy, FOOTER_NAME_W, fh, BLACK);
-    d.setClipRect(FOOTER_NAME_X, fy, FOOTER_NAME_W, fh);
-    setFooterText(COL_FOOTER_TXT);
+    int nx = FOOTER_NAME_X + FOOTER_ICON_SLOT;  // make room for the always-present transport icon
+    int nw = FOOTER_NAME_W - FOOTER_ICON_SLOT;
+    d.setClipRect(nx, fy, nw, fh);
+    setFooterText(COL_FOOTER_TXT);  // transparent bg, so it overlays the progress line behind it
     std::string name = g_play_path.empty() ? "stopped" : basename(g_play_path);
-    d.setCursor(FOOTER_NAME_X - g_marquee.offset_px, fy + (fh - 8) / 2);
+    d.setCursor(nx - g_marquee.offset_px, fy + (fh - 8) / 2);
     d.print(name.c_str());
     d.clearClipRect();
-}
-
-static void drawSlotProgress() {
-    auto& d = g_canvas;
-    int fy = footerY();
-    int fh = footerH();
-    int by = fy + (fh - FOOTER_BAR_H) / 2;
-    bool playing = !g_play_path.empty() && !g_paused;
-    // Amber while leveling is active (replaces the old "L" glyph as the on/off
-    // cue); otherwise slate-blue while playing, grey while paused / stopped.
-    uint16_t col = !playing            ? COL_FOOTER_IDLE
-                 : g_leveling_enabled  ? COL_LEVEL_ACCENT
-                                       : COL_FOOTER_PROG;
-    d.fillRect(FOOTER_PROG_X, fy, FOOTER_PROG_W, fh, BLACK);
-    d.drawRect(FOOTER_PROG_X, by, FOOTER_PROG_W, FOOTER_BAR_H, col);
-    if (g_src && !g_play_path.empty()) {
-        uint32_t pos = g_src->getPos();
-        uint32_t sz  = g_src->getSize();
-        if (sz > 0) {
-            int inner = FOOTER_PROG_W - 2;
-            int w = (int)((uint64_t)pos * inner / sz);
-            if (w < 0) w = 0;
-            if (w > inner) w = inner;
-            if (w > 0) {
-                d.fillRect(FOOTER_PROG_X + 1, by + 1, w, FOOTER_BAR_H - 2, col);
-            }
-        }
-    }
 }
 
 static void drawSlotVolume() {
     auto& d = g_canvas;
     int fy = footerY();
     int fh = footerH();
-    int by = fy + (fh - FOOTER_BAR_H) / 2;
-    d.fillRect(FOOTER_VOL_X, fy, FOOTER_VOL_W, fh, BLACK);
-    // Two-char numeric to the left of the bar (e.g. "12"), so the user
-    // builds muscle memory for their preferred level.
-    constexpr int NUM_W = 2 * BASE_CHAR_W + 1;  // "NN" + 1 px gap
-    int bar_x = FOOTER_VOL_X + NUM_W;
-    int bar_w = FOOTER_VOL_W - NUM_W;
-    d.setTextSize(1);
-    d.setTextColor(COL_FOOTER_VOL, BLACK);
-    d.setCursor(FOOTER_VOL_X, fy + (fh - 8) / 2);
-    d.printf("%2d", g_volume);
-    d.drawRect(bar_x, by, bar_w, FOOTER_BAR_H, COL_FOOTER_VOL);
-    int inner = bar_w - 2;
+    // Narrow vertical bar on the left (borderless, fills bottom→top), the
+    // two-char level to its right.
+    int bar_x = FOOTER_VOL_X;
+    int num_x = FOOTER_VOL_X + FOOTER_VBAR_W + 2;
+    setFooterText(COL_FOOTER_VOL);  // font/size + transparent bg for the level digits
     int denom = (g_volume_max > 0) ? g_volume_max : 1;
-    int w = (g_volume * inner) / denom;
-    if (w > inner) w = inner;
-    if (w > 0) {
-        d.fillRect(bar_x + 1, by + 1, w, FOOTER_BAR_H - 2, COL_FOOTER_VOL);
+    int h = (g_volume * fh) / denom;
+    if (h > fh) h = fh;
+    if (h > 0) {
+        d.fillRect(bar_x, fy + (fh - h), FOOTER_VBAR_W, h, COL_FOOTER_VOL);
     }
+    d.setCursor(num_x, fy + (fh - 8) / 2);
+    d.printf("%2d", g_volume);
+}
+
+// Compose the footer as a unit, including the separator row above the band.
+// Progress line first (backmost), then the separator and text over it. Every
+// footer update goes through this so the layering stays consistent.
+static void composeFooter() {
+    g_canvas.fillRect(0, footerDrawY(), SCREEN_W, footerDrawH(), BLACK);
+    drawProgressMarker();   // progress line behind everything
+    g_canvas.drawFastHLine(0, footerY() - 1, SCREEN_W, browseFrameColor());
+    drawTransportIcon();
+    drawSlotName();
+    drawSlotVolume();
 }
 
 static void drawFooter() {
-    auto& d = g_canvas;
-    d.fillRect(0, footerY(), SCREEN_W, footerH(), BLACK);
-    drawSlotName();
-    drawSlotProgress();
-    drawSlotVolume();
+    composeFooter();
     presentFrame();
 }
 
@@ -1824,9 +1862,10 @@ static void pollMarquee() {
         std::string name = g_play_path.empty() ? "stopped"
                                                : basename(g_play_path);
         int text_w = (int)name.size() * BASE_CHAR_W;
-        g_marquee.max_offset_px = std::max(0, text_w - FOOTER_NAME_W);
-        drawSlotName();
-        presentRows(footerY(), footerH());
+        int avail  = FOOTER_NAME_W - FOOTER_ICON_SLOT;
+        g_marquee.max_offset_px = std::max(0, text_w - avail);
+        composeFooter();
+        presentRows(footerDrawY(), footerDrawH());
         return;
     }
 
@@ -1857,8 +1896,8 @@ static void pollMarquee() {
             break;
     }
     if (g_marquee.offset_px != prev_offset) {
-        drawSlotName();
-        presentRows(footerY(), footerH());
+        composeFooter();
+        presentRows(footerDrawY(), footerDrawH());
     }
 }
 
@@ -2220,7 +2259,7 @@ static void drawWaveformColIntoCanvas(int y_top, int h, int x, int64_t col_abs) 
     if (y1 > yb_max) y1 = yb_max;
     if (y1 < y0)    y1 = y0;
     g_canvas.fillRect(x, y_top, 1, h, BLACK);
-    g_canvas.drawFastVLine(x, y0, y1 - y0 + 1, COL_FOOTER_PROG);
+    g_canvas.drawFastVLine(x, y0, y1 - y0 + 1, COL_WAVEFORM);
 
     // Loudness-leveling amplification trace: a line across the upper half of
     // the waveform whose height tracks net gain. Scaled to the current drive
@@ -2675,11 +2714,11 @@ static void jumpToTenth(int digit_index) {
     if (!g_src) return;
     uint64_t range = audioRangeBytes();
     seekToByte(g_audio_start_offset + (uint32_t)(range * digit_index / 10));
-    // The 500 ms progress-bar redraw in loop() is gated on `playing`, so
-    // a jump while paused would leave the bar stale. Update it here for
-    // immediate visual feedback regardless of paused state.
-    drawSlotProgress();
-    presentRows(footerY(), footerH());
+    // The 500 ms progress redraw in loop() is gated on `playing`, so a jump
+    // while paused would leave the marker stale. Update it here for immediate
+    // feedback regardless of paused state.
+    composeFooter();
+    presentRows(footerDrawY(), footerDrawH());
 }
 
 static void pollSeekKeys() {
@@ -2702,11 +2741,11 @@ static void pollSeekKeys() {
     if (target > audio_start + range) target = audio_start + range;
     seekToByte((uint32_t)target);
     g_last_seek_ms = now;
-    // Update only the progress slot rather than the whole footer — held-
-    // seek fires every 100 ms, so cost matters. Works while paused, when
-    // the loop()'s 500 ms-cadence redraw wouldn't fire.
-    drawSlotProgress();
-    presentRows(footerY(), footerH());
+    // Update only the marker lane rather than the whole footer — held-seek
+    // fires every 100 ms, so cost matters. Works while paused, when the
+    // loop()'s 500 ms-cadence redraw wouldn't fire.
+    composeFooter();
+    presentRows(footerDrawY(), footerDrawH());
 }
 
 static void moveSettingsCursor(int delta);
@@ -3485,11 +3524,11 @@ static void dismissResetModal() {
 //   AR_ALARM_0 .. AR_ALARM_4 — five slot rows; selecting one opens the
 //                            alarm editor (TODO: editor)
 //   AR_STANDBY             — standby brightness numeric (functional now)
-//   AR_BACK                — explicit return to Settings
+// Esc / Del back out to Settings; no explicit Back row.
 enum AlarmsRowId {
     AR_SET_TIME = 0,
     AR_ALARM_0, AR_ALARM_1, AR_ALARM_2, AR_ALARM_3, AR_ALARM_4,
-    AR_STANDBY, AR_BACK,
+    AR_STANDBY,
     AR_COUNT
 };
 
@@ -3506,7 +3545,6 @@ static void alarmsRowLabel(int row, char* buf, size_t buflen) {
     switch (row) {
         case AR_SET_TIME: snprintf(buf, buflen, "Set current time"); return;
         case AR_STANDBY:  snprintf(buf, buflen, "Clock brightness"); return;
-        case AR_BACK:     snprintf(buf, buflen, "Back"); return;
         default: {
             int slot = row - AR_ALARM_0;
             const Alarm& a = g_alarms[slot];
@@ -3522,7 +3560,6 @@ static void alarmsRowValueStr(int row, char* buf, size_t buflen) {
     switch (row) {
         case AR_SET_TIME: snprintf(buf, buflen, ">"); return;
         case AR_STANDBY:  snprintf(buf, buflen, "%d", standbyBrightness()); return;
-        case AR_BACK:     snprintf(buf, buflen, ""); return;
         default:          snprintf(buf, buflen, ">"); return;
     }
 }
@@ -3634,7 +3671,6 @@ static void moveAlarmsCursor(int delta) {
 
 static void activateAlarmsRow() {
     int row = g_alarms_cursor;
-    if (row == AR_BACK) { exitAlarms(); return; }
     if (row == AR_SET_TIME) {
         enterSetTime();
         return;
@@ -3668,7 +3704,7 @@ static void adjustAlarmsRow(int delta) {
 enum LevelingRowId {
     LV_ENABLED = 0,
     LV_DRIVE, LV_RELEASE, LV_ATTACK, LV_LOOKAHEAD, LV_CEILING,
-    LV_RESET, LV_BACK,
+    LV_RESET,
     LV_COUNT
 };
 
@@ -3681,7 +3717,6 @@ static void levelingRowLabel(int row, char* buf, size_t buflen) {
         case LV_LOOKAHEAD: snprintf(buf, buflen, "Lookahead");       return;
         case LV_CEILING:   snprintf(buf, buflen, "Ceiling");         return;
         case LV_RESET:     snprintf(buf, buflen, "Reset to default");return;
-        case LV_BACK:      snprintf(buf, buflen, "Back");            return;
     }
 }
 
@@ -3697,7 +3732,6 @@ static void levelingRowValueStr(int row, char* buf, size_t buflen) {
         case LV_CEILING: snprintf(buf, buflen, "-%d.%d dB",
                                   g_leveling_ceiling_hdb / 2, (g_leveling_ceiling_hdb % 2) * 5); return;
         case LV_RESET:   snprintf(buf, buflen, ">"); return;
-        case LV_BACK:    buf[0] = '\0'; return;
     }
 }
 
@@ -3786,7 +3820,6 @@ static void activateLevelingRow() {
             drawLeveling();
             break;
         case LV_RESET: resetLevelingToDefault(); break;
-        case LV_BACK:  exitLeveling(); break;
         default: break;  // numeric rows adjust via , / /
     }
 }
@@ -3849,7 +3882,7 @@ static void adjustLevelingRow(int delta) {
             markStateDirty();
             break;
         }
-        default:  // LV_RESET / LV_BACK — `/` activates, `,` is a no-op
+        default:  // LV_RESET — `/` activates, `,` is a no-op
             if (delta > 0) activateLevelingRow();
             return;
     }
@@ -3866,7 +3899,7 @@ enum AlarmEditorRowId {
     AE_DAYS,
     AE_VOL, AE_RAMP,
     AE_TRACK,
-    AE_PREVIEW, AE_BACK,
+    AE_PREVIEW,
     AE_COUNT
 };
 
@@ -3887,7 +3920,6 @@ static void aeRowLabel(int row, char* buf, size_t buflen) {
         case AE_RAMP:    snprintf(buf, buflen, "Ramp (s)"); return;
         case AE_ENABLED: snprintf(buf, buflen, "Enabled"); return;
         case AE_PREVIEW: snprintf(buf, buflen, "Preview"); return;
-        case AE_BACK:    snprintf(buf, buflen, "Back"); return;
     }
     (void)a;
 }
@@ -3913,7 +3945,6 @@ static void aeRowValueStr(int row, char* buf, size_t buflen) {
         case AE_RAMP:    snprintf(buf, buflen, "%u", a.ramp_s); return;
         case AE_ENABLED: snprintf(buf, buflen, "[%c]", a.enabled ? 'x' : ' '); return;
         case AE_PREVIEW: snprintf(buf, buflen, ">"); return;
-        case AE_BACK:    buf[0] = '\0'; return;
     }
 }
 
@@ -4094,7 +4125,6 @@ static void adjustAlarmEditorRow(int delta) {
 
 static void activateAlarmEditorRow() {
     int row = g_alarm_editor_cursor;
-    if (row == AE_BACK)    { exitAlarmEditor(); return; }
     if (row == AE_ENABLED) {
         Alarm& a = g_alarms[g_alarm_editor_slot];
         a.enabled = !a.enabled;
@@ -4225,7 +4255,7 @@ static void activateDaysEditorRow() {
 
 // -- Set Current Time editor --------------------------------------------
 enum SctRowId { SCT_HOUR = 0, SCT_MIN, SCT_YEAR, SCT_MONTH, SCT_DAY,
-                SCT_COMMIT, SCT_BACK, SCT_COUNT };
+                SCT_COMMIT, SCT_COUNT };
 
 static int daysInMonth(uint16_t y, uint8_t m) {
     static const uint8_t days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
@@ -4245,7 +4275,6 @@ static void sctRowLabel(int row, char* buf, size_t buflen) {
         case SCT_MONTH:  snprintf(buf, buflen, "Month"); return;
         case SCT_DAY:    snprintf(buf, buflen, "Day"); return;
         case SCT_COMMIT: snprintf(buf, buflen, "Commit"); return;
-        case SCT_BACK:   snprintf(buf, buflen, "Back"); return;
     }
 }
 
@@ -4256,8 +4285,7 @@ static void sctRowValueStr(int row, char* buf, size_t buflen) {
         case SCT_YEAR:   snprintf(buf, buflen, "%04u", g_sct_year); return;
         case SCT_MONTH:  snprintf(buf, buflen, "%02u", g_sct_month); return;
         case SCT_DAY:    snprintf(buf, buflen, "%02u", g_sct_day); return;
-        case SCT_COMMIT:
-        case SCT_BACK:   buf[0] = '\0'; return;
+        case SCT_COMMIT: buf[0] = '\0'; return;
     }
 }
 
@@ -4348,14 +4376,12 @@ static void adjustSetTimeRow(int delta) {
             break;
         }
         case SCT_COMMIT: if (delta > 0) commitSetTime(); return;
-        case SCT_BACK:   if (delta > 0) exitSetTime();  return;
     }
     drawSetTime();
 }
 
 static void activateSetTimeRow() {
     if (g_sct_cursor == SCT_COMMIT) { commitSetTime(); return; }
-    if (g_sct_cursor == SCT_BACK)   { exitSetTime();  return; }
 }
 
 static void enterBatteryLowState() {
@@ -5346,7 +5372,7 @@ void loop() {
                     else if (c == ',') adjustSetTimeRow(-1);
                     else if (c == '/') {
                         int row = g_sct_cursor;
-                        if (row == SCT_COMMIT || row == SCT_BACK) activateSetTimeRow();
+                        if (row == SCT_COMMIT) activateSetTimeRow();
                         else adjustSetTimeRow(+1);
                     }
                 }
@@ -5380,7 +5406,7 @@ void loop() {
                         // `/` increments numerics / activates actions, mirroring
                         // Alarms/Settings.
                         int row = g_alarm_editor_cursor;
-                        if (row == AE_TRACK || row == AE_PREVIEW || row == AE_BACK
+                        if (row == AE_TRACK || row == AE_PREVIEW
                             || row == AE_ENABLED || row == AE_DAYS) {
                             activateAlarmEditorRow();
                         } else {
@@ -5559,8 +5585,8 @@ void loop() {
     if (playing && millis() - g_last_progress_ms > 500) {
         g_last_progress_ms = millis();
         if (!overlayActive() && g_screen_state != SCREEN_OFF) {
-            drawSlotProgress();
-            presentFrame();
+            composeFooter();
+            presentRows(footerDrawY(), footerDrawH());
         }
     }
     // Periodic playhead persistence — marks state dirty every 10 s while
