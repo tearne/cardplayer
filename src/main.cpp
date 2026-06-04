@@ -31,7 +31,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.26.27";
+static constexpr const char* APP_VERSION = "0.26.29";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -1740,7 +1740,7 @@ static void pollBattery(bool force = false) {
 
     if (level != g_battery_level) {
         g_battery_level = level;
-        if (g_screen != Screen::KeyReference) drawHeader();
+        if (!overlayActive()) drawHeader();
     }
 
     if (level == 0) {
@@ -5228,7 +5228,7 @@ void loop() {
         // rely on later draws to pick this one-shot transition up.
         if (!g_first_keypress_seen) {
             g_first_keypress_seen = true;
-            drawHeader();
+            if (!overlayActive()) drawHeader();
         }
 
         // --- Universal pre-pass, before the per-screen dispatch -----------
@@ -5509,10 +5509,10 @@ void loop() {
         } else if (state.del) {
             // In search mode, backspace edits the query and exits when
             // empty. In track-pick mode, Del cancels back to the editor.
-            // Otherwise, Del opens the reset confirmation.
+            // In the plain browser Del does nothing — reset lives in
+            // Settings → Reset all, not on a stray destructive keypress.
             if (g_search_active)    searchBackspace();
             else if (g_pick_slot >= 0) exitPickMode(/*restore_path=*/true);
-            else                    showResetModal();
         } else {
             // Plain bindings — fire only when Fn is not held. In search
             // mode, alphanumeric characters and space append to the query;

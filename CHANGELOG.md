@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.26.29 — 2026-06-04
+
+- `Del` in the file browser no longer springs the "Reset all" confirmation — a leftover from the old keymap. Reset all stays available under Settings. (`Del` is unchanged in search and track-pick mode.)
+
+## 0.26.28 — 2026-06-04
+
+- Fixed the header occasionally drawing over the chess board: a battery-level change while chess (or any full-screen view) is open no longer triggers a header redraw on top of it.
+
 ## 0.26.27 — 2026-06-04
 
 - Footer rework. The track name now gets most of the footer width. Volume moves to a slim borderless vertical cyan bar with its number to the right; track position is a thin 2 px red line behind the name (replacing the old horizontal progress bar). A new transport icon at the far left always shows playback state by shape — ▶ playing, ❚❚ paused, ■ stopped — and turns from green to amber while leveling is on, replacing the separate leveling "knee" icon.

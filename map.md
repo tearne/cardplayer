@@ -489,7 +489,7 @@ Read-only sub-screen of [Settings](#settings) listing every key binding by secti
 
 [Up](#settings)
 
-A modal guarding the destructive "Reset all": `/` confirms — wiping saved settings back to defaults and returning to the root — while any other key cancels. Reached from the Settings "Reset all" row (and from `Del` in the browser).
+A modal guarding the destructive "Reset all": `/` confirms — wiping saved settings back to defaults and returning to the root — while any other key cancels. Reached from the Settings "Reset all" row.
 
 # Alarms
 
