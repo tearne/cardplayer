@@ -373,7 +373,7 @@ Entered with `Ctrl+H`; exits on `` ` `` (Esc) or any unrecognised keypress, retu
 
 - CPU plays a random legal move (PoC — placeholder for a real engine).
 
-- Board state stored in NVS under a separate `chess` namespace.
+- Game state — the full position plus the chosen CPU difficulty — stored in NVS under a separate `chess` namespace.
 
 - Game-over display offers `n` to start a fresh game; any other key exits.
 
@@ -422,7 +422,7 @@ User-facing state survives power cycles so volume, volume cap, brightness, curre
 
 Emergency shutdown does not save — persistence runs during normal operation, never as a shutdown step. Whatever was dirty at cutoff is lost.
 
-[Chess](#chess) board state persists under a separate `chess` NVS namespace with its own save path — written on every move rather than via the player-state dirty/flush coalesce, since chess writes are rare.
+[Chess](#chess) game state — the full position plus the chosen CPU difficulty — persists under a separate `chess` NVS namespace with its own save path, written on every move rather than via the player-state dirty/flush coalesce, since chess writes are rare.
 
 **Detail**
 
@@ -455,6 +455,9 @@ Row kinds, each with a distinct state glyph:
 - **Action** — `>` ("press enter to activate / navigate").
 
 Navigation: `;` / `.` move the cursor (auto-repeat). `enter` toggles or activates. `,` / `/` adjust — for numeric rows, step the value (auto-repeat across long ranges like volume max 0..64); for toggle rows, `,` turns off and `/` turns on. Volume (`-` / `=`) and pause (`space`) pass through. Dismiss with `` ` `` (Esc), `Del`, or any letter key.
+
+> [!IMPORTANT]
+> Every menu reached from Settings — Alarms, Leveling, Settings data, and their sub-menus — honours the same navigation contract: `;`/`.` move, `,`/`/` adjust or activate (`,` off/down, `/` on/up/activate), `enter` activate, `` ` ``/`Del` back. A new menu that diverges from it is a bug.
 
 **Detail**
 

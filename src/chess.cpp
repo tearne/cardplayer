@@ -782,17 +782,29 @@ static void cpuMove() {
 
 // --- Persistence ---------------------------------------------------------
 
+// Single source of truth for the chess namespace's keys: save, load and the
+// Settings-data audit (via isKnownKey) all reference these names, so a key
+// this build writes can never be mistaken for stale.
 static const char* PREFS_NS = "chess";
+namespace keys {
+constexpr const char* BOARD  = "board";
+constexpr const char* SIDE   = "side";
+constexpr const char* CASTLE = "castle";
+constexpr const char* EP     = "ep";
+constexpr const char* LAST   = "last";
+constexpr const char* DIFF   = "diff";
+constexpr const char* ALL[] = { BOARD, SIDE, CASTLE, EP, LAST, DIFF };
+}
 
 static void save() {
     Preferences prefs;
     if (!prefs.begin(PREFS_NS, false)) return;
-    prefs.putBytes("board", g_pos.board, 64);
-    prefs.putChar ("side",   (char)g_pos.side);
-    prefs.putUChar("castle", g_pos.castle);
-    prefs.putChar ("ep",     (char)g_pos.ep);
-    prefs.putString("last",  g_last_move);
-    prefs.putChar ("diff",   (char)g_difficulty);
+    prefs.putBytes(keys::BOARD,  g_pos.board, 64);
+    prefs.putChar (keys::SIDE,   (char)g_pos.side);
+    prefs.putUChar(keys::CASTLE, g_pos.castle);
+    prefs.putChar (keys::EP,     (char)g_pos.ep);
+    prefs.putString(keys::LAST,  g_last_move);
+    prefs.putChar (keys::DIFF,   (char)g_difficulty);
     prefs.end();
 }
 
@@ -800,13 +812,13 @@ static bool load() {
     Preferences prefs;
     if (!prefs.begin(PREFS_NS, true)) return false;
     bool ok = false;
-    if (prefs.isKey("board")) {
-        size_t n = prefs.getBytes("board", g_pos.board, 64);
+    if (prefs.isKey(keys::BOARD)) {
+        size_t n = prefs.getBytes(keys::BOARD, g_pos.board, 64);
         if (n == 64) {
-            g_pos.side   = (int8_t)prefs.getChar ("side",   +1);
-            g_pos.castle = prefs.getUChar("castle", 0x0F);
-            g_pos.ep     = (int8_t)prefs.getChar ("ep",     -1);
-            String s = prefs.getString("last", "-");
+            g_pos.side   = (int8_t)prefs.getChar (keys::SIDE,   +1);
+            g_pos.castle = prefs.getUChar(keys::CASTLE, 0x0F);
+            g_pos.ep     = (int8_t)prefs.getChar (keys::EP,     -1);
+            String s = prefs.getString(keys::LAST, "-");
             std::strncpy(g_last_move, s.c_str(), sizeof(g_last_move) - 1);
             g_last_move[sizeof(g_last_move) - 1] = 0;
             ok = true;
@@ -815,11 +827,18 @@ static bool load() {
     // Difficulty is independent of the rest of position state — load it
     // regardless, defaulting to HARD on missing key (matches existing
     // installs' implicit behaviour from before this setting existed).
-    int8_t d = (int8_t)prefs.getChar("diff", (char)HARD);
+    int8_t d = (int8_t)prefs.getChar(keys::DIFF, (char)HARD);
     if (d < EASY || d > HARD) d = HARD;
     g_difficulty = (Difficulty)d;
     prefs.end();
     return ok;
+}
+
+const char* prefsNamespace() { return PREFS_NS; }
+
+bool isKnownKey(const char* key) {
+    for (const char* k : keys::ALL) if (strcmp(k, key) == 0) return true;
+    return false;
 }
 
 static void newGame() {

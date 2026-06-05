@@ -11,6 +11,7 @@
 #include <freertos/semphr.h>
 #include <esp_timer.h>
 #include <Preferences.h>
+#include <nvs.h>
 
 #include <AudioFileSourceSD.h>
 #include <AudioGenerator.h>
@@ -31,7 +32,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.26.29";
+static constexpr const char* APP_VERSION = "0.27.2";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -275,6 +276,7 @@ static int  g_days_editor_cursor = 0;
 // they sit outside the tree.
 enum class Screen {
     Main, Settings, KeyReference, ResetModal,
+    SettingsData, SettingsDataList, NvsDeleteConfirm,
     Alarms, SetTime, AlarmEditor, DaysEditor, TrackPicker,
     Leveling,
     Chess, ChessConfirm, Standby, AlarmFiring, AlarmSnoozing,
@@ -296,6 +298,9 @@ static Screen parentOf(Screen s) {
         case Screen::Settings:     return Screen::Main;
         case Screen::KeyReference: return Screen::Settings;
         case Screen::ResetModal:   return Screen::Settings;
+        case Screen::SettingsData: return Screen::Settings;
+        case Screen::SettingsDataList: return Screen::SettingsData;
+        case Screen::NvsDeleteConfirm: return Screen::SettingsData;
         case Screen::Alarms:       return Screen::Settings;
         case Screen::Leveling:     return Screen::Settings;
         case Screen::ChessConfirm: return Screen::Main;
@@ -537,6 +542,7 @@ static bool                            g_search_active = false;
 static inline bool transportAllowed() {
     return !(g_screen == Screen::Main && g_search_active)
         && g_screen != Screen::ResetModal
+        && g_screen != Screen::NvsDeleteConfirm
         && g_screen != Screen::ChessConfirm
         && !fullScreenClockActive();
 }
@@ -927,46 +933,103 @@ static void markStateDirty() {
     }
 }
 
+// --- Persisted keys: single source of truth ------------------------------
+// Every key the `player` namespace stores is named here once. loadState,
+// flushStateIfDirty and the Settings-data audit all reference these names,
+// so the writer and the auditor can never disagree about what a current
+// build legitimately stores. Any player key not produced here is stale.
+namespace player_keys {
+
+constexpr const char* VOL            = "vol";
+constexpr const char* FONT           = "font";
+constexpr const char* DIAG           = "diag";
+constexpr const char* WRAP           = "wrap";
+constexpr const char* HIDE_NA        = "hidena";
+constexpr const char* AUTO_NEXT      = "autonx";
+constexpr const char* AUTO_WAVE      = "autowv";
+constexpr const char* AUTO_SPEC      = "autosp";
+constexpr const char* VOL_MAX        = "volmax";
+constexpr const char* IDLE_TO        = "idleto";
+constexpr const char* BRIGHT         = "bright";
+constexpr const char* STANDBY_BRIGHT = "stbybr";
+constexpr const char* LVL            = "lvl";
+constexpr const char* LVL_DB         = "lvldb";
+constexpr const char* LVL_REL        = "lvlrel";
+constexpr const char* LVL_AT         = "lvlat";
+constexpr const char* LVL_LA         = "lvlla";
+constexpr const char* LVL_CE         = "lvlce";
+constexpr const char* FOLDER         = "folder";
+constexpr const char* CURSOR         = "cursor";
+constexpr const char* TRACK          = "track";
+constexpr const char* TRKPOS         = "trkpos";
+
+constexpr const char* FIXED[] = {
+    VOL, FONT, DIAG, WRAP, HIDE_NA, AUTO_NEXT, AUTO_WAVE, AUTO_SPEC,
+    VOL_MAX, IDLE_TO, BRIGHT, STANDBY_BRIGHT, LVL, LVL_DB, LVL_REL,
+    LVL_AT, LVL_LA, LVL_CE, FOLDER, CURSOR, TRACK, TRKPOS,
+};
+
+// Per-slot alarm keys are generated, not listed: "a<slot>_<suffix>".
+constexpr const char* ALARM_SUFFIXES[] = { "hm", "d", "v", "r", "e", "t" };
+
+inline void alarmKey(char* out, size_t n, int slot, const char* suffix) {
+    snprintf(out, n, "a%d_%s", slot, suffix);
+}
+
+inline bool isKnown(const char* key) {
+    for (const char* k : FIXED) if (strcmp(k, key) == 0) return true;
+    for (int slot = 0; slot < ALARM_COUNT; ++slot)
+        for (const char* suffix : ALARM_SUFFIXES) {
+            char k[12];
+            alarmKey(k, sizeof(k), slot, suffix);
+            if (strcmp(k, key) == 0) return true;
+        }
+    return false;
+}
+
+}  // namespace player_keys
+
 // Read every persisted item, falling back to the existing in-memory
 // default when a key is absent. Folder fallback to "/" is enforced by
 // the caller after the SD scan; track fallback (saved path missing) is
 // enforced when we attempt to resume.
 static void loadState() {
+    using namespace player_keys;
     if (!g_prefs.begin("player", true)) return;  // RO
-    g_volume             = g_prefs.getInt   ("vol",    g_volume);
-    g_font_notch         = g_prefs.getInt   ("font",   g_font_notch);
-    g_diagnostics_hidden = g_prefs.getBool  ("diag",   g_diagnostics_hidden);
-    g_wrap_names         = g_prefs.getBool  ("wrap",   g_wrap_names);
-    g_hide_non_audio     = g_prefs.getBool  ("hidena", g_hide_non_audio);
-    g_auto_play_next     = g_prefs.getBool  ("autonx", g_auto_play_next);
-    g_auto_waveform      = g_prefs.getBool  ("autowv", g_auto_waveform);
-    g_auto_spectrum      = g_prefs.getBool  ("autosp", g_auto_spectrum);
-    g_volume_max         = g_prefs.getInt   ("volmax", g_volume_max);
-    g_idle_timeout_idx   = g_prefs.getInt   ("idleto", g_idle_timeout_idx);
-    g_brightness_idx     = g_prefs.getInt   ("bright", g_brightness_idx);
-    g_standby_brightness_idx = g_prefs.getInt("stbybr", g_standby_brightness_idx);
-    g_leveling_enabled   = g_prefs.getBool  ("lvl",    g_leveling_enabled);
-    g_leveling_drive_db  = g_prefs.getInt   ("lvldb",  g_leveling_drive_db);
-    g_leveling_release_ds = g_prefs.getInt  ("lvlrel", g_leveling_release_ds);
-    g_leveling_attack_hms = g_prefs.getInt  ("lvlat",  g_leveling_attack_hms);
-    g_leveling_lookahead_ms = g_prefs.getInt("lvlla",  g_leveling_lookahead_ms);
-    g_leveling_ceiling_hdb = g_prefs.getInt ("lvlce",  g_leveling_ceiling_hdb);
+    g_volume             = g_prefs.getInt   (VOL,            g_volume);
+    g_font_notch         = g_prefs.getInt   (FONT,           g_font_notch);
+    g_diagnostics_hidden = g_prefs.getBool  (DIAG,           g_diagnostics_hidden);
+    g_wrap_names         = g_prefs.getBool  (WRAP,           g_wrap_names);
+    g_hide_non_audio     = g_prefs.getBool  (HIDE_NA,        g_hide_non_audio);
+    g_auto_play_next     = g_prefs.getBool  (AUTO_NEXT,      g_auto_play_next);
+    g_auto_waveform      = g_prefs.getBool  (AUTO_WAVE,      g_auto_waveform);
+    g_auto_spectrum      = g_prefs.getBool  (AUTO_SPEC,      g_auto_spectrum);
+    g_volume_max         = g_prefs.getInt   (VOL_MAX,        g_volume_max);
+    g_idle_timeout_idx   = g_prefs.getInt   (IDLE_TO,        g_idle_timeout_idx);
+    g_brightness_idx     = g_prefs.getInt   (BRIGHT,         g_brightness_idx);
+    g_standby_brightness_idx = g_prefs.getInt(STANDBY_BRIGHT, g_standby_brightness_idx);
+    g_leveling_enabled   = g_prefs.getBool  (LVL,            g_leveling_enabled);
+    g_leveling_drive_db  = g_prefs.getInt   (LVL_DB,         g_leveling_drive_db);
+    g_leveling_release_ds = g_prefs.getInt  (LVL_REL,        g_leveling_release_ds);
+    g_leveling_attack_hms = g_prefs.getInt  (LVL_AT,         g_leveling_attack_hms);
+    g_leveling_lookahead_ms = g_prefs.getInt(LVL_LA,         g_leveling_lookahead_ms);
+    g_leveling_ceiling_hdb = g_prefs.getInt (LVL_CE,         g_leveling_ceiling_hdb);
     for (int i = 0; i < ALARM_COUNT; ++i) {
-        char k[8];
-        snprintf(k, sizeof(k), "a%d_hm", i);
+        char k[12];
+        alarmKey(k, sizeof(k), i, "hm");
         uint16_t hm = g_prefs.getUShort(k, (uint16_t)((g_alarms[i].hour << 8) | g_alarms[i].minute));
         g_alarms[i].hour   = (hm >> 8) & 0xFF;
         g_alarms[i].minute =  hm       & 0xFF;
-        snprintf(k, sizeof(k), "a%d_d", i);   g_alarms[i].days    = g_prefs.getUChar(k, g_alarms[i].days);
-        snprintf(k, sizeof(k), "a%d_v", i);   g_alarms[i].volume  = g_prefs.getUChar(k, g_alarms[i].volume);
-        snprintf(k, sizeof(k), "a%d_r", i);   g_alarms[i].ramp_s  = g_prefs.getUChar(k, g_alarms[i].ramp_s);
-        snprintf(k, sizeof(k), "a%d_e", i);   g_alarms[i].enabled = g_prefs.getUChar(k, 0) != 0;
-        snprintf(k, sizeof(k), "a%d_t", i);   g_alarms[i].track   = std::string(g_prefs.getString(k, "").c_str());
+        alarmKey(k, sizeof(k), i, "d");   g_alarms[i].days    = g_prefs.getUChar(k, g_alarms[i].days);
+        alarmKey(k, sizeof(k), i, "v");   g_alarms[i].volume  = g_prefs.getUChar(k, g_alarms[i].volume);
+        alarmKey(k, sizeof(k), i, "r");   g_alarms[i].ramp_s  = g_prefs.getUChar(k, g_alarms[i].ramp_s);
+        alarmKey(k, sizeof(k), i, "e");   g_alarms[i].enabled = g_prefs.getUChar(k, 0) != 0;
+        alarmKey(k, sizeof(k), i, "t");   g_alarms[i].track   = std::string(g_prefs.getString(k, "").c_str());
     }
-    g_cur_path           = std::string(g_prefs.getString("folder", g_cur_path.c_str()).c_str());
-    g_cursor             = g_prefs.getInt   ("cursor", g_cursor);
-    g_play_path          = std::string(g_prefs.getString("track",  g_play_path.c_str()).c_str());
-    g_saved_playhead     = g_prefs.getUInt  ("trkpos", 0);
+    g_cur_path           = std::string(g_prefs.getString(FOLDER, g_cur_path.c_str()).c_str());
+    g_cursor             = g_prefs.getInt   (CURSOR, g_cursor);
+    g_play_path          = std::string(g_prefs.getString(TRACK,  g_play_path.c_str()).c_str());
+    g_saved_playhead     = g_prefs.getUInt  (TRKPOS, 0);
     g_prefs.end();
     // Clamp loaded values defensively — corrupt or out-of-range values
     // fall back to safe defaults rather than indexing past array ends.
@@ -999,38 +1062,39 @@ static void loadState() {
 static void flushStateIfDirty() {
     if (!g_state_dirty) return;
     if (millis() - g_state_dirty_since_ms < PERSIST_FLUSH_MS) return;
+    using namespace player_keys;
     if (!g_prefs.begin("player", false)) return;  // RW
-    g_prefs.putInt   ("vol",    g_volume);
-    g_prefs.putInt   ("font",   g_font_notch);
-    g_prefs.putBool  ("diag",   g_diagnostics_hidden);
-    g_prefs.putBool  ("wrap",   g_wrap_names);
-    g_prefs.putBool  ("hidena", g_hide_non_audio);
-    g_prefs.putBool  ("autonx", g_auto_play_next);
-    g_prefs.putBool  ("autowv", g_auto_waveform);
-    g_prefs.putBool  ("autosp", g_auto_spectrum);
-    g_prefs.putInt   ("volmax", g_volume_max);
-    g_prefs.putInt   ("idleto", g_idle_timeout_idx);
-    g_prefs.putInt   ("bright", g_brightness_idx);
-    g_prefs.putInt   ("stbybr", g_standby_brightness_idx);
-    g_prefs.putBool  ("lvl",    g_leveling_enabled);
-    g_prefs.putInt   ("lvldb",  g_leveling_drive_db);
-    g_prefs.putInt   ("lvlrel", g_leveling_release_ds);
-    g_prefs.putInt   ("lvlat",  g_leveling_attack_hms);
-    g_prefs.putInt   ("lvlla",  g_leveling_lookahead_ms);
-    g_prefs.putInt   ("lvlce",  g_leveling_ceiling_hdb);
+    g_prefs.putInt   (VOL,            g_volume);
+    g_prefs.putInt   (FONT,           g_font_notch);
+    g_prefs.putBool  (DIAG,           g_diagnostics_hidden);
+    g_prefs.putBool  (WRAP,           g_wrap_names);
+    g_prefs.putBool  (HIDE_NA,        g_hide_non_audio);
+    g_prefs.putBool  (AUTO_NEXT,      g_auto_play_next);
+    g_prefs.putBool  (AUTO_WAVE,      g_auto_waveform);
+    g_prefs.putBool  (AUTO_SPEC,      g_auto_spectrum);
+    g_prefs.putInt   (VOL_MAX,        g_volume_max);
+    g_prefs.putInt   (IDLE_TO,        g_idle_timeout_idx);
+    g_prefs.putInt   (BRIGHT,         g_brightness_idx);
+    g_prefs.putInt   (STANDBY_BRIGHT, g_standby_brightness_idx);
+    g_prefs.putBool  (LVL,            g_leveling_enabled);
+    g_prefs.putInt   (LVL_DB,         g_leveling_drive_db);
+    g_prefs.putInt   (LVL_REL,        g_leveling_release_ds);
+    g_prefs.putInt   (LVL_AT,         g_leveling_attack_hms);
+    g_prefs.putInt   (LVL_LA,         g_leveling_lookahead_ms);
+    g_prefs.putInt   (LVL_CE,         g_leveling_ceiling_hdb);
     for (int i = 0; i < ALARM_COUNT; ++i) {
-        char k[8];
-        snprintf(k, sizeof(k), "a%d_hm", i);
+        char k[12];
+        alarmKey(k, sizeof(k), i, "hm");
         g_prefs.putUShort(k, (uint16_t)((g_alarms[i].hour << 8) | g_alarms[i].minute));
-        snprintf(k, sizeof(k), "a%d_d", i);   g_prefs.putUChar (k, g_alarms[i].days);
-        snprintf(k, sizeof(k), "a%d_v", i);   g_prefs.putUChar (k, g_alarms[i].volume);
-        snprintf(k, sizeof(k), "a%d_r", i);   g_prefs.putUChar (k, g_alarms[i].ramp_s);
-        snprintf(k, sizeof(k), "a%d_e", i);   g_prefs.putUChar (k, g_alarms[i].enabled ? 1 : 0);
-        snprintf(k, sizeof(k), "a%d_t", i);   g_prefs.putString(k, g_alarms[i].track.c_str());
+        alarmKey(k, sizeof(k), i, "d");   g_prefs.putUChar (k, g_alarms[i].days);
+        alarmKey(k, sizeof(k), i, "v");   g_prefs.putUChar (k, g_alarms[i].volume);
+        alarmKey(k, sizeof(k), i, "r");   g_prefs.putUChar (k, g_alarms[i].ramp_s);
+        alarmKey(k, sizeof(k), i, "e");   g_prefs.putUChar (k, g_alarms[i].enabled ? 1 : 0);
+        alarmKey(k, sizeof(k), i, "t");   g_prefs.putString(k, g_alarms[i].track.c_str());
     }
-    g_prefs.putString("folder", g_cur_path.c_str());
-    g_prefs.putInt   ("cursor", g_cursor);
-    g_prefs.putString("track",  g_play_path.c_str());
+    g_prefs.putString(FOLDER, g_cur_path.c_str());
+    g_prefs.putInt   (CURSOR, g_cursor);
+    g_prefs.putString(TRACK,  g_play_path.c_str());
     // Current playhead byte offset, captured under the audio mutex so the
     // audio task can't reconfigure g_src under us.
     uint32_t pos = 0;
@@ -1039,7 +1103,7 @@ static void flushStateIfDirty() {
         if (g_src) pos = g_src->getPos();
         xSemaphoreGive(g_audio_mutex);
     }
-    g_prefs.putUInt  ("trkpos", pos);
+    g_prefs.putUInt  (player_keys::TRKPOS, pos);
     g_prefs.end();
     g_state_dirty = false;
 }
@@ -2752,6 +2816,9 @@ static void moveSettingsCursor(int delta);
 static void adjustSettingsRow(int delta);
 static void changeVolume(int delta);
 static void drawSettings();
+static void enterSettingsData();
+static void moveSettingsDataCursor(int delta);
+static void scrollNvsList(int delta);
 
 // Auto-repeat for `;` / `.` (move cursor) and `,` / `/` (adjust value)
 // while Settings is shown. Mirrors pollBrowserNavKeys' 400 ms initial
@@ -2786,7 +2853,8 @@ static void activateSetTimeRow();
 static void pollSettingsKeys() {
     bool menu_screen = g_screen == Screen::Settings || g_screen == Screen::Alarms
         || g_screen == Screen::AlarmEditor || g_screen == Screen::DaysEditor
-        || g_screen == Screen::SetTime || g_screen == Screen::Leveling;
+        || g_screen == Screen::SetTime || g_screen == Screen::Leveling
+        || g_screen == Screen::SettingsData || g_screen == Screen::SettingsDataList;
     if (!menu_screen) {
         g_settings_press_ms  = 0;
         g_settings_repeat_key = 0;
@@ -2839,6 +2907,12 @@ static void pollSettingsKeys() {
             else if (active == '.') moveLevelingCursor(+1);
             else if (active == ',') adjustLevelingRow(-1);
             else if (active == '/') adjustLevelingRow(+1);
+        } else if (g_screen == Screen::SettingsData) {
+            if      (active == ';') moveSettingsDataCursor(-1);
+            else if (active == '.') moveSettingsDataCursor(+1);
+        } else if (g_screen == Screen::SettingsDataList) {
+            if      (active == ';') scrollNvsList(-1);
+            else if (active == '.') scrollNvsList(+1);
         } else {
             if      (active == ';') moveSettingsCursor(-1);
             else if (active == '.') moveSettingsCursor(+1);
@@ -2902,7 +2976,8 @@ static uint32_t g_vol_last_ms  = 0;
 
 static void pollVolumeKeys() {
     if (g_screen == Screen::ResetModal || g_screen == Screen::KeyReference
-        || g_screen == Screen::ChessConfirm) {
+        || g_screen == Screen::ChessConfirm || g_screen == Screen::SettingsData
+        || g_screen == Screen::SettingsDataList || g_screen == Screen::NvsDeleteConfirm) {
         g_vol_press_ms = 0;
         return;
     }
@@ -3173,7 +3248,7 @@ enum SettingsRowId {
     SR_DIAG = 0, SR_WRAP, SR_HIDE_NA, SR_AUTO_NEXT, SR_AUTO_WAVE, SR_AUTO_SPEC,
     SR_FONT, SR_VOLMAX, SR_LEVELING,
     SR_BRIGHT, SR_IDLE, SR_CHESS_LEVEL,
-    SR_ALARMS, SR_KEY_REF, SR_REBUILD, SR_RESET,
+    SR_ALARMS, SR_KEY_REF, SR_REBUILD, SR_SETTINGS_DATA, SR_RESET,
     SR_COUNT
 };
 
@@ -3201,6 +3276,7 @@ static const SettingsRow SETTINGS_ROWS[SR_COUNT] = {
     {SRK_ACTION,  "Alarms..."},
     {SRK_ACTION,  "Key reference"},
     {SRK_ACTION,  "Rebuild index"},
+    {SRK_ACTION,  "Settings data"},
     {SRK_ACTION,  "Reset all"},
 };
 
@@ -3379,6 +3455,9 @@ static void activateSettingsRow() {
                 FuzzyIndex::startRebuild();
                 drawSettings();
                 break;
+            case SR_SETTINGS_DATA:
+                enterSettingsData();
+                break;
             case SR_ALARMS:
                 enterAlarms();
                 break;
@@ -3516,6 +3595,342 @@ static void confirmReset() {
 
 static void dismissResetModal() {
     goToScreen(g_modal_return);
+}
+
+// -- Settings data (NVS audit) -------------------------------------------
+// A view onto the NVS key-value store, reached from the "Settings data" row.
+// Top level is a small menu: how many stored keys are stale (left behind by
+// an older firmware), how many are current, and a guarded action that erases
+// every stale key at once. Each count opens a scrollable sub-list of those
+// keys with their values.
+
+struct NvsEntry {
+    char       ns[NVS_NS_NAME_MAX_SIZE];
+    char       key[NVS_KEY_NAME_MAX_SIZE];
+    nvs_type_t type;
+    bool       stale;
+};
+
+static std::vector<NvsEntry> g_nvs_entries;
+static size_t g_nvs_used  = 0;
+static size_t g_nvs_total = 0;
+
+static void drawSettingsDataMenu();   // defined below; deletion returns here
+
+// A stored key is current when its owning namespace claims it. Player and
+// chess are the only namespaces this build writes; anything else is wholly
+// stale.
+static bool nvsKeyIsStale(const char* ns, const char* key) {
+    if (strcmp(ns, "player") == 0)                return !player_keys::isKnown(key);
+    if (strcmp(ns, chess::prefsNamespace()) == 0) return !chess::isKnownKey(key);
+    return true;
+}
+
+static int nvsStaleCount() {
+    int n = 0;
+    for (const NvsEntry& e : g_nvs_entries) if (e.stale) ++n;
+    return n;
+}
+
+// Render a stored value as text: scalars as their number, strings verbatim,
+// blobs as a byte count since they have no one-line form (the chess board is
+// 64 raw bytes).
+static void nvsFormatValue(const NvsEntry& e, char* out, size_t n) {
+    nvs_handle_t h;
+    if (nvs_open(e.ns, NVS_READONLY, &h) != ESP_OK) { snprintf(out, n, "?"); return; }
+    switch (e.type) {
+        case NVS_TYPE_U8:  { uint8_t  v=0; nvs_get_u8 (h, e.key, &v); snprintf(out, n, "%u",   v); break; }
+        case NVS_TYPE_I8:  { int8_t   v=0; nvs_get_i8 (h, e.key, &v); snprintf(out, n, "%d",   v); break; }
+        case NVS_TYPE_U16: { uint16_t v=0; nvs_get_u16(h, e.key, &v); snprintf(out, n, "%u",   v); break; }
+        case NVS_TYPE_I16: { int16_t  v=0; nvs_get_i16(h, e.key, &v); snprintf(out, n, "%d",   v); break; }
+        case NVS_TYPE_U32: { uint32_t v=0; nvs_get_u32(h, e.key, &v); snprintf(out, n, "%lu",  (unsigned long)v); break; }
+        case NVS_TYPE_I32: { int32_t  v=0; nvs_get_i32(h, e.key, &v); snprintf(out, n, "%ld",  (long)v); break; }
+        case NVS_TYPE_U64: { uint64_t v=0; nvs_get_u64(h, e.key, &v); snprintf(out, n, "%llu", (unsigned long long)v); break; }
+        case NVS_TYPE_I64: { int64_t  v=0; nvs_get_i64(h, e.key, &v); snprintf(out, n, "%lld", (long long)v); break; }
+        case NVS_TYPE_STR: {
+            size_t len = 0;
+            if (nvs_get_str(h, e.key, nullptr, &len) == ESP_OK && len > 0) {
+                std::vector<char> tmp(len);
+                if (nvs_get_str(h, e.key, tmp.data(), &len) == ESP_OK) snprintf(out, n, "%s", tmp.data());
+                else snprintf(out, n, "?");
+            } else {
+                out[0] = '\0';
+            }
+            break;
+        }
+        case NVS_TYPE_BLOB: {
+            size_t len = 0;
+            nvs_get_blob(h, e.key, nullptr, &len);
+            snprintf(out, n, "<%u bytes>", (unsigned)len);
+            break;
+        }
+        default: snprintf(out, n, "?"); break;
+    }
+    nvs_close(h);
+}
+
+// Walk the whole NVS partition into g_nvs_entries and refresh the fullness
+// figures. Called on entry and after a delete.
+static void scanNvs() {
+    g_nvs_entries.clear();
+    nvs_stats_t st;
+    if (nvs_get_stats(nullptr, &st) == ESP_OK) {
+        g_nvs_used  = st.used_entries;
+        g_nvs_total = st.total_entries;
+    }
+    nvs_iterator_t it = nullptr;
+    esp_err_t res = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY, &it);
+    while (res == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        NvsEntry e;
+        strncpy(e.ns,  info.namespace_name, sizeof(e.ns));  e.ns[sizeof(e.ns)-1]   = 0;
+        strncpy(e.key, info.key,            sizeof(e.key)); e.key[sizeof(e.key)-1] = 0;
+        e.type  = info.type;
+        e.stale = nvsKeyIsStale(info.namespace_name, info.key);
+        g_nvs_entries.push_back(e);
+        res = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+}
+
+// -- Delete-stale confirmation --------------------------------------------
+
+static void drawNvsDeleteModal() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setTextSize(2);
+    constexpr int CELL_W = 12, CELL_H = 16;
+    auto drawLine = [&](const char* s, int y, uint16_t fg) {
+        d.setTextColor(fg, BLACK);
+        d.setCursor((SCREEN_W - (int)strlen(s) * CELL_W) / 2, y);
+        d.print(s);
+    };
+    char head[24];
+    snprintf(head, sizeof(head), "Delete %d stale?", nvsStaleCount());
+    int y = 18;
+    drawLine(head,         y, COL_FILE_BRIGHT);  y += CELL_H + 14;
+    drawLine("/ = yes",    y, COL_FILE_BRIGHT);  y += CELL_H + 4;
+    drawLine("other = no", y, COL_HEADER_TXT);
+    presentFrame();
+}
+
+static void showNvsDeleteModal() {
+    if (nvsStaleCount() == 0) return;   // nothing to delete
+    g_screen = Screen::NvsDeleteConfirm;
+    drawNvsDeleteModal();
+}
+
+static void dismissNvsDeleteModal() {
+    g_screen = Screen::SettingsData;
+    drawSettingsDataMenu();
+}
+
+// Erase every stale key across all namespaces, then re-scan so the counts
+// reflect the cleaned store.
+static void deleteAllStale() {
+    for (const NvsEntry& e : g_nvs_entries) {
+        if (!e.stale) continue;
+        nvs_handle_t h;
+        if (nvs_open(e.ns, NVS_READWRITE, &h) != ESP_OK) continue;
+        nvs_erase_key(h, e.key);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    scanNvs();
+    g_screen = Screen::SettingsData;
+    drawSettingsDataMenu();
+}
+
+// -- Key sub-list (stale or current) --------------------------------------
+// The entries are flattened into display lines ahead of drawing so that long
+// keys and values wrap across rows and scrolling is a simple line offset.
+
+struct NvsListLine { String text; uint16_t color; };
+static std::vector<NvsListLine> g_nvs_lines;
+static bool g_nvs_show_stale = false;
+static int  g_nvs_line_top   = 0;
+
+static int nvsListWidthChars() {
+    int usable = (SCREEN_W - (SCROLLBAR_W + 2) - 4) / charW();
+    return usable < 1 ? 1 : usable;
+}
+
+static int nvsListRowsPerScreen() {
+    int rows = (SCREEN_H / rowH()) - 1;   // minus the title strip
+    return rows < 1 ? 1 : rows;
+}
+
+// Push `s` as one or more display lines, each at most `width` chars and
+// prefixed by `indent` spaces, so an over-long string wraps instead of
+// running off the screen.
+static void appendWrappedLine(const char* s, int indent, uint16_t color, int width) {
+    int avail = width - indent;
+    if (avail < 1) avail = 1;
+    int len = (int)strlen(s);
+    if (len == 0) return;
+    for (int off = 0; off < len; off += avail) {
+        String line;
+        for (int k = 0; k < indent; ++k) line += ' ';
+        int seg = std::min(avail, len - off);
+        for (int k = 0; k < seg; ++k) line += s[off + k];
+        g_nvs_lines.push_back({line, color});
+    }
+}
+
+static void buildNvsLines(bool stale) {
+    g_nvs_lines.clear();
+    int width = nvsListWidthChars();
+    for (const NvsEntry& e : g_nvs_entries) {
+        if (e.stale != stale) continue;
+        uint16_t key_col = stale ? COL_WARN : COL_FILE_BRIGHT;
+        uint16_t val_col = stale ? COL_WARN : COL_HEADER_TXT;
+        char label[40];
+        snprintf(label, sizeof(label), "%s.%s", e.ns, e.key);
+        appendWrappedLine(label, 0, key_col, width);
+        char val[256];
+        nvsFormatValue(e, val, sizeof(val));
+        appendWrappedLine(val[0] ? val : "(empty)", 2, val_col, width);
+    }
+}
+
+static void drawNvsList() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setFont(notchFont());
+    d.setTextSize(notchSize());
+    d.setTextWrap(false, false);
+
+    int rh = rowH();
+    int rows = nvsListRowsPerScreen();
+    int total = (int)g_nvs_lines.size();
+
+    // Title strip: which list, and how many entries it holds.
+    d.fillRect(0, 0, SCREEN_W, rh, COL_HAIRLINE);
+    d.setTextColor(COL_FILE_BRIGHT, COL_HAIRLINE);
+    d.setCursor(2, 2);
+    int count = g_nvs_show_stale ? nvsStaleCount()
+                                 : (int)g_nvs_entries.size() - nvsStaleCount();
+    char title[24];
+    snprintf(title, sizeof(title), "%s (%d)", g_nvs_show_stale ? "Stale" : "Current", count);
+    d.print(title);
+
+    for (int i = 0; i < rows; ++i) {
+        int idx = g_nvs_line_top + i;
+        if (idx >= total) break;
+        const NvsListLine& ln = g_nvs_lines[idx];
+        d.setTextColor(ln.color, BLACK);
+        d.setCursor(2, rh + i * rh + 2);
+        d.print(ln.text);
+    }
+
+    if (total > rows) {
+        int track_y = rh;
+        int track_h = SCREEN_H - rh;
+        int thumb_h = (track_h * rows) / total;
+        if (thumb_h < SCROLLBAR_MIN_H) thumb_h = SCROLLBAR_MIN_H;
+        int thumb_top = track_y + (int)((int64_t)(track_h - thumb_h) * g_nvs_line_top
+                                        / std::max(1, total - rows));
+        d.fillRect(SCREEN_W - SCROLLBAR_W, thumb_top, SCROLLBAR_W, thumb_h, COL_SETTINGS_SEL_BG);
+    }
+
+    d.setFont(&fonts::Font0);
+    presentFrame();
+}
+
+static void enterNvsList(bool stale) {
+    g_nvs_show_stale = stale;
+    buildNvsLines(stale);
+    g_nvs_line_top = 0;
+    g_screen = Screen::SettingsDataList;
+    drawNvsList();
+}
+
+static void scrollNvsList(int delta) {
+    int max_top = std::max(0, (int)g_nvs_lines.size() - nvsListRowsPerScreen());
+    int target = g_nvs_line_top + delta;
+    if (target < 0) target = 0;
+    if (target > max_top) target = max_top;
+    if (target == g_nvs_line_top) return;
+    g_nvs_line_top = target;
+    drawNvsList();
+}
+
+// -- Top-level menu -------------------------------------------------------
+
+enum SettingsDataRow { SDR_STALE = 0, SDR_CURRENT, SDR_DELETE, SDR_DATA_COUNT };
+static int g_settings_data_cursor = 0;
+
+static void drawSettingsDataMenu() {
+    auto& d = g_canvas;
+    d.fillScreen(BLACK);
+    d.setFont(notchFont());
+    d.setTextSize(notchSize());
+    d.setTextWrap(false, false);
+
+    int rh = rowH();
+    int cw = charW();
+
+    // Title strip: name on the left, fullness summary on the right.
+    d.fillRect(0, 0, SCREEN_W, rh, COL_HAIRLINE);
+    d.setTextColor(COL_FILE_BRIGHT, COL_HAIRLINE);
+    d.setCursor(2, 2);
+    d.print("Settings data");
+    {
+        int pct = g_nvs_total ? (int)((g_nvs_used * 100) / g_nvs_total) : 0;
+        char sum[24];
+        snprintf(sum, sizeof(sum), "%u/%u %d%%",
+                 (unsigned)g_nvs_used, (unsigned)g_nvs_total, pct);
+        int w = (int)strlen(sum) * cw;
+        d.setCursor(SCREEN_W - w - 2, 2);
+        d.print(sum);
+    }
+
+    int stale   = nvsStaleCount();
+    int current = (int)g_nvs_entries.size() - stale;
+    const char* names[SDR_DATA_COUNT] = { "Stale", "Current", "Delete all stale" };
+    for (int i = 0; i < SDR_DATA_COUNT; ++i) {
+        int y = rh + i * rh;
+        bool sel = (i == g_settings_data_cursor);
+        if (sel) d.fillRect(0, y, SCREEN_W, rh, COL_SETTINGS_SEL_BG);
+        uint16_t bg = sel ? COL_SETTINGS_SEL_BG : BLACK;
+        d.setTextColor(COL_FILE_BRIGHT, bg);
+        d.setCursor(2, y + 2);
+        d.print(names[i]);
+
+        char right[8];
+        if      (i == SDR_STALE)   snprintf(right, sizeof(right), "%d >", stale);
+        else if (i == SDR_CURRENT) snprintf(right, sizeof(right), "%d >", current);
+        else                       snprintf(right, sizeof(right), ">");
+        int rw = (int)strlen(right) * cw;
+        d.setCursor(SCREEN_W - rw - 4, y + 2);
+        d.print(right);
+    }
+
+    d.setFont(&fonts::Font0);
+    presentFrame();
+}
+
+static void enterSettingsData() {
+    scanNvs();
+    g_settings_data_cursor = 0;
+    g_screen = Screen::SettingsData;
+    drawSettingsDataMenu();
+}
+
+static void moveSettingsDataCursor(int delta) {
+    int t = ((g_settings_data_cursor + delta) % SDR_DATA_COUNT + SDR_DATA_COUNT) % SDR_DATA_COUNT;
+    if (t == g_settings_data_cursor) return;
+    g_settings_data_cursor = t;
+    drawSettingsDataMenu();
+}
+
+static void activateSettingsDataRow() {
+    switch (g_settings_data_cursor) {
+        case SDR_STALE:   enterNvsList(true);   break;
+        case SDR_CURRENT: enterNvsList(false);  break;
+        case SDR_DELETE:  showNvsDeleteModal(); break;
+    }
 }
 
 // -- Alarms sub-menu -----------------------------------------------------
@@ -4732,6 +5147,9 @@ static void renderScreen() {
         case Screen::Settings:      drawSettings();   break;
         case Screen::KeyReference:  drawHelp();        break;
         case Screen::ResetModal:    drawResetModal();  break;
+        case Screen::SettingsData:     drawSettingsDataMenu(); break;
+        case Screen::SettingsDataList: drawNvsList();          break;
+        case Screen::NvsDeleteConfirm: drawNvsDeleteModal();   break;
         case Screen::Alarms:        drawAlarms();      break;
         case Screen::Leveling:      drawLeveling();    break;
         case Screen::SetTime:       drawSetTime();     break;
@@ -5344,6 +5762,43 @@ void loop() {
                 confirmReset();
             } else if (!state.word.empty() || state.del || state.space) {
                 dismissResetModal();
+            }
+        } else if (g_screen == Screen::NvsDeleteConfirm) {
+            // `/` confirms the bulk stale-key delete; any other key cancels.
+            bool confirm = false;
+            for (char c : state.word) if (c == '/') confirm = true;
+            if (confirm) {
+                deleteAllStale();
+            } else if (!state.word.empty() || state.del || state.space) {
+                dismissNvsDeleteModal();
+            }
+        } else if (g_screen == Screen::SettingsData) {
+            // Top-level audit menu: `;` / `.` move, Enter opens the selected
+            // row (a sub-list, or the delete-stale confirm), Del backs out to
+            // Settings. Back (`` ` ``) is handled by the pre-pass.
+            if (state.enter) {
+                activateSettingsDataRow();
+            } else if (state.del) {
+                goToScreen(Screen::Settings);
+            } else {
+                for (char c : state.word) {
+                    if      (c == ';') moveSettingsDataCursor(-1);
+                    else if (c == '.') moveSettingsDataCursor(+1);
+                    // `/` activates the row, matching action rows elsewhere in
+                    // Settings; `,` is a no-op (nothing to decrement).
+                    else if (c == '/') activateSettingsDataRow();
+                }
+            }
+        } else if (g_screen == Screen::SettingsDataList) {
+            // Read-only key list: `;` / `.` scroll, Del backs to the audit
+            // menu. Back (`` ` ``) is handled by the pre-pass.
+            if (state.del) {
+                goToScreen(Screen::SettingsData);
+            } else {
+                for (char c : state.word) {
+                    if      (c == ';') scrollNvsList(-1);
+                    else if (c == '.') scrollNvsList(+1);
+                }
             }
         } else if (g_screen == Screen::KeyReference) {
             // Key-reference sub-screen: `;` / `.` scroll, any other key

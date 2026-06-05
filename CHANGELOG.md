@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.2 — 2026-06-05
+
+- New Settings → "Settings data" screen for inspecting the saved-settings store (NVS). Shows how full the store is, counts of current versus stale keys (leftovers from older firmware), and a guarded "delete all stale" action. Each count opens a scrollable list of those keys and their values.
+
 ## 0.26.29 — 2026-06-04
 
 - `Del` in the file browser no longer springs the "Reset all" confirmation — a leftover from the old keymap. Reset all stays available under Settings. (`Del` is unchanged in search and track-pick mode.)

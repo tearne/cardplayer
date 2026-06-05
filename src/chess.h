@@ -20,6 +20,12 @@ void enter();               // become active; redraws
 void exit();                // become inactive; saves state
 bool active();
 
+// The NVS namespace chess stores its state under, and whether a key within
+// it is one this build writes. The Settings-data audit uses these to flag
+// stale chess keys left by older firmware.
+const char* prefsNamespace();
+bool        isKnownKey(const char* key);
+
 // CPU difficulty. Persists in the chess NVS namespace. Default HARD —
 // matches the full-strength engine.
 enum Difficulty : int8_t { EASY = 0, MEDIUM = 1, HARD = 2 };
