@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.7 — 2026-06-17
+
+- Folders now remember where you were. Each folder keeps a breadcrumb to the most-recently-played track in its sub-tree, shown in amber with the cursor resting on it when the folder opens — follow it down to reach that track (resuming where you left off, including mid-track), or step into a sibling to see its own. The trail lives on the SD card as a hidden `.cardplayer` file per folder, so it survives a power-off, a reflash, and moving the card to another device. Playing a track or letting it auto-advance updates the trail; alarms leave it alone.
+
 ## 0.27.2 — 2026-06-05
 
 - New Settings → "Settings data" screen for inspecting the saved-settings store (NVS). Shows how full the store is, counts of current versus stale keys (leftovers from older firmware), and a guarded "delete all stale" action. Each count opens a scrollable list of those keys and their values.

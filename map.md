@@ -22,7 +22,8 @@ Application
 │ │   └ Emergency Shutdown
 │ ├ Footer
 │ ├ Browser
-│ │ └ Fuzzy Search
+│ │ ├ Fuzzy Search
+│ │ └ Recent-track Trail
 │ └ Visualisation
 │   ├ Waveform
 │   └ Spectrum
@@ -45,6 +46,8 @@ Application
 │ └ Console Diagnostics
 ├ Screen Idle (unreviewed)
 └ Persisted State
+  ├ Player State
+  └ Write Model
 ```
 
 # Main
@@ -195,18 +198,35 @@ Developer readouts over the USB serial console — no on-screen UI, present in e
 
 [Up](#main)
 [Down](#fuzzy-search)
+[Down](#recent-track-trail)
 
 > [!WARNING]
 > Unreviewed.
 
 The main area between the header and footer. Hosts three views: a directory listing (default), a [Fuzzy Search](#fuzzy-search) entered by typing a letter, and a [Visualisation](#visualisation) overlay (waveform and/or spectrum) toggled by `Ctrl+W` / `Ctrl+S` during playback.
 
-The directory listing is a single full-width column of the current directory's entries — directories first (bright cyan), then audio files (light grey), alphabetical within each group. Non-audio files are hidden by default and only appear when the "Hide non-audio" [Settings](#settings) toggle is off; they then render in dim grey at the tail of the list. Long names wrap or clip per `\` toggle. Selected row gets a subtle dark blue-grey tint. A narrow scrollbar gutter on the right indicates position when the list overflows. Slate-blue frames mark this view. Remains visible during playback.
+The directory listing is a single full-width column of the current directory's entries — directories first (bright cyan), then audio files (light grey), alphabetical within each group. Non-audio files are hidden by default and only appear when the "Hide non-audio" [Settings](#settings) toggle is off; they then render in dim grey at the tail of the list. Long names wrap or clip per `\` toggle. Selected row gets a subtle dark blue-grey tint. The child leading to the folder's most-recently-played track shows in amber (the [Recent-track Trail](#recent-track-trail)). A narrow scrollbar gutter on the right indicates position when the list overflows. Slate-blue frames mark this view. Remains visible during playback.
 
 **See also**
 
 - [Controls](#controls-and-navigation) — wrap mode is toggled by `\`
 - [Settings](#settings) — "Hide non-audio" filter controls non-audio visibility
+
+# Recent-track Trail
+
+[Up](#browser)
+
+Each folder remembers the path to the most-recently-played track in its sub-tree. The child on that path — a subfolder, or the track itself — shows in amber, and the cursor rests on it when the folder opens, so following the amber from any level walks straight down to that track; stepping into a sibling instead reveals that branch's own trail. Playing the amber track resumes it where it left off (including mid-track); playing any other row starts from the beginning.
+
+A folder with no tracks of its own still points the way down, since the amber marks the child toward the newest descendant, not a track directly.
+
+**Detail**
+
+- Each folder stores a hidden `.cardplayer` file: the child name, plus the playhead at the leaf. The pointer is written up the whole path when a track starts; the leaf playhead refreshes at boundaries (pause, stop, track change, standby), never during steady playback.
+
+- A deliberate play and auto-play-next both move the trail; alarm fires and track-pick do not. A pointer to a since-removed child yields no marker.
+
+- Storage lives with the card — see [Persisted State](#persisted-state).
 
 # Fuzzy Search
 
@@ -414,21 +434,34 @@ Up to five alarms are configured under Settings → [Alarms](#alarms); each fire
 # Persisted State
 
 [Up](#application)
+[Down](#player-state)
+[Down](#write-model)
 
-> [!WARNING]
-> Unreviewed.
+User-facing state survives power cycles, held across three stores: the [Player State](#player-state) in the `player` NVS namespace, the [Chess](#chess) game state in its own NVS namespace, and the browser's per-folder breadcrumbs on the SD card. On boot the saved track loads paused at its position — playback only starts on space.
 
-User-facing state survives power cycles so volume, volume cap, brightness, current folder + cursor, font size, wrap / diagnostics / hide-non-audio / auto-play-next / auto-waveform / auto-spectrum toggles, idle timeout, and the playing track come back the way they were. On boot the saved track loads paused — playback only starts on space. Intra-track position is not persisted.
+The breadcrumb trail — the most-recently-played track and its position, remembered per folder — lives on the card as hidden files rather than in NVS, so it travels with the card and survives a reflash. See [Browser](#browser).
 
-Emergency shutdown does not save — persistence runs during normal operation, never as a shutdown step. Whatever was dirty at cutoff is lost.
+# Player State
 
-[Chess](#chess) game state — the full position plus the chosen CPU difficulty — persists under a separate `chess` NVS namespace with its own save path, written on every move rather than via the player-state dirty/flush coalesce, since chess writes are rare.
+[Up](#persisted-state)
+
+The inventory that comes back the way it was: volume and volume cap, brightness, font size, the wrap / diagnostics / hide-non-audio / auto-play-next / auto-waveform / auto-spectrum toggles, the idle timeout, the current folder + cursor, and the playing track with its playhead — all in the `player` NVS namespace.
+
+The playhead is saved periodically while a track plays, so a power cut resumes within a few seconds of where it had reached.
+
+**See also**
+
+- [Write Model](#write-model) — when these values are written and how loss is bounded
+
+# Write Model
+
+[Up](#persisted-state)
+
+How player state reaches NVS and how loss is bounded. Mutators set a dirty flag; the loop flushes once the flag has held for 5 seconds, so a burst of keypresses or fast scrolling coalesces into a single write. Persistence runs only during normal operation — never as a shutdown step — so whatever was dirty at cutoff is lost.
 
 **Detail**
 
 - Storage is NVS via Arduino's `Preferences`. SD-independent, robust to power loss between writes.
-
-- Mutators set a dirty flag; the loop flushes after the flag has been set for 5 seconds — a burst of keypresses or fast scrolling coalesces into one write.
 
 - Missing saved folder falls back to root; out-of-range cursor clamps to the last entry; missing saved track leaves no playback active. Corrupt or unreadable saved data falls back silently to compiled-in defaults, equivalent to a fresh boot.
 

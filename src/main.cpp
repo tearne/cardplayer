@@ -32,7 +32,7 @@
 #define SD_MOSI 14
 #define SD_CS   12
 
-static constexpr const char* APP_VERSION = "0.27.2";
+static constexpr const char* APP_VERSION = "0.28.7";
 
 static constexpr int SCREEN_W     = 240;
 static constexpr int SCREEN_H     = 135;
@@ -156,6 +156,7 @@ static constexpr uint16_t COL_DIR_NORMAL    = 0x4FDF;  // bright cyan — distin
 static constexpr uint16_t COL_FILE_BRIGHT   = 0xFFFF;  // white (used in help, "(empty)")
 static constexpr uint16_t COL_FILE_NORMAL   = 0xC618;  // light grey — readable, clearly not cyan
 static constexpr uint16_t COL_OTHER_NORMAL  = 0x2104;  // dim grey — unplayable, deliberately recessive
+static constexpr uint16_t COL_BREADCRUMB    = 0xFD20;  // amber — most-recently-played trail child; reuses the browser's warm accent (COL_MARKER) so it reads on the blue/orange browse theme
 // Background tint behind the browser's selected row. Slate-blue, a notch
 // dimmer than COL_BROWSE_FRAME so the row reads as filled-but-recessive
 // rather than competing with the frame for attention. Every channel is
@@ -491,6 +492,11 @@ static std::string           g_cur_path = "/";
 static std::vector<Entry>    g_entries;
 static int                   g_cursor = 0;
 static int                   g_top    = 0;
+// Row of the breadcrumb child in g_entries (-1 = none here), and the
+// playhead to resume from when that child is the track itself. Resolved
+// each time a folder opens.
+static int                   g_breadcrumb_row = -1;
+static uint32_t              g_breadcrumb_pos = 0;
 
 // Force a full redraw of the visualisation area on the next render
 // (e.g. on activation, mode change, browser size change, or snap). Set
@@ -694,6 +700,67 @@ static std::string parentPath(const std::string& path) {
     return path.substr(0, slash);
 }
 
+// --- Recent-track breadcrumb -------------------------------------------
+// Every played-from folder carries a hidden `.cardplayer` file naming the
+// child on the path to its most-recently-played descendant track — a
+// subfolder for an intermediate folder, the track itself for the folder
+// that holds it — plus the track's playhead at the leaf. Following the
+// trail reopens each folder where its listening last reached, independent
+// of its siblings. The data lives on the card, so it survives a reflash
+// and travels if the card moves to another device.
+
+static constexpr const char* BREADCRUMB_FILE = ".cardplayer";
+
+struct Breadcrumb { std::string child; uint32_t playhead; };
+
+static bool readBreadcrumb(const std::string& folder, Breadcrumb& out) {
+    File f = SD.open(joinPath(folder, BREADCRUMB_FILE).c_str(), FILE_READ);
+    if (!f) return false;
+    String child = f.readStringUntil('\n');
+    String pos   = f.readStringUntil('\n');
+    f.close();
+    child.trim();
+    if (child.length() == 0) return false;
+    out.child    = child.c_str();
+    out.playhead = (uint32_t)strtoul(pos.c_str(), nullptr, 10);
+    return true;
+}
+
+static void writeBreadcrumb(const std::string& folder, const std::string& child,
+                            uint32_t playhead) {
+    File f = SD.open(joinPath(folder, BREADCRUMB_FILE).c_str(), FILE_WRITE);
+    if (!f) return;
+    f.printf("%s\n%u\n", child.c_str(), (unsigned)playhead);
+    f.close();
+}
+
+// Mark the played track in every folder from its own up to the root, each
+// pointing one segment further down. Only the leaf folder carries the
+// playhead; the ancestors record 0 since their child is a folder.
+static void recordBreadcrumbTrail(const std::string& track_path, uint32_t playhead) {
+    std::string leaf_dir = parentPath(track_path);
+    writeBreadcrumb(leaf_dir, basename(track_path), playhead);
+    for (std::string dir = leaf_dir; dir != "/"; ) {
+        std::string parent = parentPath(dir);
+        writeBreadcrumb(parent, basename(dir), 0);
+        dir = parent;
+    }
+}
+
+// Refresh the leaf folder's stored playhead at a playback boundary (pause,
+// stop, track change, standby) — never during steady streaming, to keep
+// card writes off the audio path. Only a folder that already points at
+// this track is touched; boundaries never establish a pointer, so a track
+// that was never deliberately played (e.g. an alarm) leaves no mark.
+static void saveBreadcrumbPlayhead(const std::string& track_path, uint32_t playhead) {
+    if (track_path.empty()) return;
+    std::string folder = parentPath(track_path);
+    Breadcrumb bc;
+    if (readBreadcrumb(folder, bc) && bc.child == basename(track_path)) {
+        writeBreadcrumb(folder, bc.child, playhead);
+    }
+}
+
 static int kindOrder(EntryKind k) {
     switch (k) {
         case KIND_DIR:   return 0;
@@ -807,7 +874,13 @@ static void applyLeveling() {
 static void stopPlayback() {
     AudioGenerator* gen_to_free = nullptr;
     AudioFileSource* src_to_free = nullptr;
+    // Capture the outgoing track's playhead so the boundary write below can
+    // persist it once the audio mutex is released — a stop is a boundary
+    // (stop, skip, track change, standby all land here).
+    std::string outgoing_path = g_play_path;
+    uint32_t    outgoing_pos  = 0;
     if (g_audio_mutex) xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+    if (g_src) outgoing_pos = g_src->getPos();
     // Drop pre-buffered samples + stop the speaker queue so user-initiated
     // stop / skip feels instant. Without this the ~220 ms of audio in the
     // path would play out after the keypress before any new track starts.
@@ -831,6 +904,7 @@ static void stopPlayback() {
     if (g_audio_mutex) xSemaphoreGive(g_audio_mutex);
     delete gen_to_free;
     delete src_to_free;
+    saveBreadcrumbPlayhead(outgoing_path, outgoing_pos);
     markStateDirty();
 }
 
@@ -1966,7 +2040,7 @@ static void pollMarquee() {
 }
 
 static void drawEntry(int x, int col_w, int y, const Entry& e,
-                      bool selected, bool wrap) {
+                      bool selected, bool breadcrumb, bool wrap) {
     auto& d = g_canvas;
     int cpl   = charsPerLine(col_w);
     int rows  = entryRows(e, col_w, wrap);
@@ -1978,7 +2052,7 @@ static void drawEntry(int x, int col_w, int y, const Entry& e,
     // plays — a different affordance for the same key.
     uint16_t sel_bg_col = (g_pick_slot >= 0) ? COL_SETTINGS_SEL_BG : COL_SELECTION_BG;
     uint16_t bg = selected ? sel_bg_col : BLACK;
-    uint16_t fg = kindColour(e.kind);
+    uint16_t fg = breadcrumb ? COL_BREADCRUMB : kindColour(e.kind);
 
     d.fillRect(x, y, col_w, h, bg);
     d.setFont(notchFont());
@@ -2031,7 +2105,10 @@ static int drawColumn(int x, int col_w, const std::vector<Entry>& items,
         int rows = entryRows(items[i], content_w, wrap);
         int h = rows * rh;
         bool selected = (i == cursor);
-        drawEntry(x, content_w, y, items[i], selected, wrap);
+        // Violet only in the music browser; pick mode reuses this column
+        // but its yellow affordance shouldn't carry the trail marker.
+        bool breadcrumb = (g_pick_slot < 0 && i == g_breadcrumb_row);
+        drawEntry(x, content_w, y, items[i], selected, breadcrumb, wrap);
         // Hairline above every entry except the first visible one. Drawn
         // after drawEntry so its bg fill doesn't overwrite the line.
         if (i > top) {
@@ -2457,12 +2534,47 @@ static void draw() {
     drawFooter();
 }
 
+// Locate this folder's breadcrumb child in the current listing, so the row
+// can be drawn violet and resumed from. A missing file or a pointer to a
+// since-removed child leaves no breadcrumb. Must be re-run whenever the
+// listing is rebuilt, since the row index is into g_entries.
+static void resolveBreadcrumbRow() {
+    g_breadcrumb_row = -1;
+    g_breadcrumb_pos = 0;
+    Breadcrumb bc;
+    if (readBreadcrumb(g_cur_path, bc)) {
+        for (int i = 0; i < (int)g_entries.size(); ++i) {
+            if (g_entries[i].name == bc.child) {
+                g_breadcrumb_row = i;
+                g_breadcrumb_pos = bc.playhead;
+                break;
+            }
+        }
+    }
+}
+
+// Rest the cursor on this folder's breadcrumb child, so opening a folder
+// lands on where its listening last reached, falling back to the top.
+static void placeCursorOnBreadcrumb() {
+    resolveBreadcrumbRow();
+    g_cursor = (g_breadcrumb_row >= 0) ? g_breadcrumb_row : 0;
+}
+
 static void loadDir(const std::string& path) {
     g_cur_path = path;
     scanDir(path, g_entries);
-    g_cursor = 0;
     g_top = 0;
+    placeCursorOnBreadcrumb();
     markStateDirty();
+}
+
+// After a play lays a new trail, move the violet marker to follow it live
+// rather than waiting for the folder to be reopened. Re-reading the
+// displayed folder's file leaves the marker untouched when the played
+// track lives elsewhere, and shifts it to the new track when it doesn't.
+static void refreshVisibleBreadcrumb() {
+    resolveBreadcrumbRow();
+    if (g_screen == Screen::Main && !g_search_active && !overlayActive()) drawBrowser();
 }
 
 static void moveCursor(int delta) {
@@ -2603,9 +2715,18 @@ static void activateSelection() {
             enterAlarmEditor(slot);
             return;
         }
-        // `/` on any audio entry — including the currently-playing one —
-        // starts it from the beginning. Pause/resume stays on `space`.
+        // `/` on the violet breadcrumb row resumes where listening left
+        // off; on any other row it starts from the beginning. Pause/resume
+        // stays on `space`.
+        bool resume = (g_cursor == g_breadcrumb_row && g_breadcrumb_pos > 0);
+        uint32_t resume_pos = resume ? g_breadcrumb_pos : 0;
         startPlayback(full);
+        if (resume && g_src) {
+            uint32_t sz = g_src->getSize();
+            if (resume_pos >= g_audio_start_offset && resume_pos < sz) seekToByte(resume_pos);
+        }
+        recordBreadcrumbTrail(full, resume_pos);
+        refreshVisibleBreadcrumb();
         drawFooter();
     }
 }
@@ -2727,6 +2848,17 @@ static void ascend() {
 static void togglePause() {
     if (g_play_path.empty()) return;
     g_paused = !g_paused;
+    // Pausing is a boundary: persist the leaf playhead so the folder
+    // reopens here even after a power-off with no later stop or skip.
+    if (g_paused) {
+        uint32_t pos = 0;
+        if (g_audio_mutex) {
+            xSemaphoreTake(g_audio_mutex, portMAX_DELAY);
+            if (g_src) pos = g_src->getPos();
+            xSemaphoreGive(g_audio_mutex);
+        }
+        saveBreadcrumbPlayhead(g_play_path, pos);
+    }
     // The audio task gates copy() on g_paused, so the player stops feeding
     // the output while paused. setActive(false) would also work but would
     // run end()-style teardown; keeping the flag-gate model preserves
@@ -2754,6 +2886,8 @@ static void skipTrack(int delta) {
     // start when the user hits space.
     bool was_paused = g_paused;
     startPlayback(full, was_paused);
+    recordBreadcrumbTrail(full, 0);
+    refreshVisibleBreadcrumb();
     drawFooter();
 }
 
@@ -3059,6 +3193,7 @@ static void jumpToPlaying() {
     if (g_play_path.empty() || g_play_dir.empty()) return;
     g_cur_path = g_play_dir;
     scanDir(g_cur_path, g_entries);
+    resolveBreadcrumbRow();
     std::string name = basename(g_play_path);
     g_cursor = 0;
     for (int i = 0; i < (int)g_entries.size(); ++i) {
@@ -5540,14 +5675,15 @@ void setup() {
 
     // Try the saved folder; if the SD scan comes back empty (folder gone
     // since last save, or saved value was never valid), fall back to root.
-    // Saved cursor restored when the folder loaded; out-of-range gets
-    // clamped to the last entry. loadDir resets g_cursor to 0; capture the
-    // saved value first and re-apply afterwards.
+    // Boot restores the exact saved cursor, not the breadcrumb row loadDir
+    // would otherwise rest on — the breadcrumb governs in-session opens,
+    // while boot resumes where the user left the bookmark. Out-of-range
+    // gets clamped to the last entry.
     int saved_cursor = g_cursor;
     loadDir(g_cur_path);
     if (g_entries.empty() && g_cur_path != "/") loadDir("/");
-    if (saved_cursor > 0 && !g_entries.empty()) {
-        g_cursor = std::min(saved_cursor, (int)g_entries.size() - 1);
+    if (!g_entries.empty()) {
+        g_cursor = std::min(std::max(saved_cursor, 0), (int)g_entries.size() - 1);
     }
 
     applyVolume();
